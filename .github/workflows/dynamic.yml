@@ -17,272 +17,430 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: List available simulators
-        run: xcrun simctl list devices available | grep -E "iPhone|iPad" | head -20
-
-      - name: Boot iPhone 16 simulator
+      - name: Select simulator
         run: |
-          SIM_ID=$(xcrun simctl list devices available | grep "iPhone 16 " | grep -v "Plus\|Pro\|Max" | head -1 | grep -oE '[A-F0-9-]{36}')
+          xcrun simctl list devices available | grep iPhone | head -20
+          SIM_ID=$(xcrun simctl list devices available -j | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          for runtime, devices in data['devices'].items():
+              if 'iOS-18' in runtime or 'iOS-17' in runtime:
+                  for d in devices:
+                      if d['isAvailable'] and 'iPhone' in d['name']:
+                          print(d['udid'])
+                          raise SystemExit(0)
+          ")
           echo "SIM_ID=$SIM_ID" >> $GITHUB_ENV
-          echo "Using simulator: $SIM_ID"
-          xcrun simctl boot "$SIM_ID" || true
-          xcrun simctl bootstatus "$SIM_ID" -b
+          echo "Selected sim: $SIM_ID"
 
-      - name: Extract + install Tripsy
+      - name: Boot simulator
+        run: |
+          SIM_ID="${{ env.SIM_ID }}"
+          open -a Simulator
+          sleep 5
+          xcrun simctl boot "$SIM_ID" 2>/dev/null || true
+          xcrun simctl bootstatus "$SIM_ID" -b
+          echo "Simulator ready"
+
+      # ─── TRIPSY ────────────────────────────────────────────────────────────
+
+      - name: Extract Tripsy IPA
         run: |
           cd /tmp/ipas
           unzip -q Tripsy.ipa -d tripsy_app
-
-          # Resign for simulator (ad-hoc) — strip signing, add simulator entitlements
-          APP_PATH=$(find /tmp/ipas/tripsy_app/Payload -name "*.app" -maxdepth 1)
+          APP_PATH=$(find /tmp/ipas/tripsy_app/Payload -name "*.app" -maxdepth 1 -type d)
           echo "APP_PATH=$APP_PATH" >> $GITHUB_ENV
-          echo "App: $APP_PATH"
+          echo "Tripsy app: $APP_PATH"
+          ls "$APP_PATH" | head -20
 
-          # Build fat/simulator binary if needed — app is ARM64 device only
-          # macOS 15 on Apple Silicon can run ARM64 simulator directly
-          codesign --remove-signature "$APP_PATH/Tripsy" 2>/dev/null || true
-          codesign --remove-signature "$APP_PATH" 2>/dev/null || true
-
-          # Remove PlugIns (extensions can't run in sim without device entitlements)
-          rm -rf "$APP_PATH/PlugIns" || true
-
-          # Ad-hoc sign
-          codesign -f -s - "$APP_PATH/Frameworks/"* 2>/dev/null || true
-          codesign -f -s - "$APP_PATH"
-
-          # Install
-          xcrun simctl install "$SIM_ID" "$APP_PATH"
-          echo "Tripsy installed"
-
-      - name: Extract color assets from Tripsy
+      - name: Extract Tripsy color assets
         run: |
-          APP_PATH="${{ env.APP_PATH }}"
           mkdir -p /tmp/artifacts/tripsy-colors
-
-          # Dump full assetutil catalog first
-          xcrun assetutil --info "$APP_PATH/Assets.car" > /tmp/artifacts/tripsy-colors/full_catalog.json 2>&1 || true
-          echo "Full catalog size: $(wc -c < /tmp/artifacts/tripsy-colors/full_catalog.json) bytes"
-
-          # Parse colors from full_catalog.json
+          xcrun assetutil --info "${{ env.APP_PATH }}/Assets.car" \
+            > /tmp/artifacts/tripsy-colors/full_catalog.json 2>&1 || true
           python3 << 'PYEOF'
-          import json, sys
-          with open("/tmp/artifacts/tripsy-colors/full_catalog.json") as f:
-              content = f.read()
-          try:
-              data = json.loads(content)
-          except Exception as e:
-              print(f"Parse error: {e}")
-              sys.exit(0)
+          import json
+          raw = open("/tmp/artifacts/tripsy-colors/full_catalog.json").read()
+          idx = raw.find('[')
+          data = json.loads(raw[idx:]) if idx >= 0 else []
           colors = [x for x in data if x.get("AssetType") == "Color"]
-          print(f"Found {len(colors)} color entries")
-          color_report = {}
+          def to_hex(comps):
+              if isinstance(comps, list) and len(comps) >= 3:
+                  return "#{:02X}{:02X}{:02X}".format(int(comps[0]*255),int(comps[1]*255),int(comps[2]*255))
+              return None
+          report = {}
           for c in colors:
               name = c.get("Name", "unknown")
-              comps = c.get("Color", {}).get("components", {})
-              space = c.get("Color", {}).get("colorspace", "srgb")
-              appearance = c.get("Appearances", [{}])[0].get("Appearance", "Any")
-              entry = {"space": space, "components": comps, "appearance": appearance, "raw": c}
-              if name not in color_report:
-                  color_report[name] = []
-              color_report[name].append(entry)
+              comps = c.get("Color components", [])
+              appearance = c.get("Appearance", "Any")
+              if name not in report:
+                  report[name] = {}
+              report[name][appearance] = {"hex": to_hex(comps), "components": comps}
           with open("/tmp/artifacts/tripsy-colors/colors.json", "w") as f:
-              json.dump(color_report, f, indent=2)
+              json.dump(report, f, indent=2)
           with open("/tmp/artifacts/tripsy-colors/colors.md", "w") as f:
-              f.write("# Tripsy Color Palette\n\n")
-              f.write(f"Total named colors: {len(color_report)}\n\n")
-              for name, variants in sorted(color_report.items()):
-                  f.write(f"## {name}\n")
-                  for v in variants:
-                      comps = v.get("components", {})
-                      r = comps.get("red", comps.get("r", "?"))
-                      g = comps.get("green", comps.get("g", "?"))
-                      b = comps.get("blue", comps.get("b", "?"))
-                      a = comps.get("alpha", comps.get("a", 1.0))
-                      f.write(f"- **{v.get('appearance', 'Any')}** ({v.get('space', 'srgb')}): R={r} G={g} B={b} A={a}\n")
-                  f.write("\n")
-          print("Done writing colors.json and colors.md")
+              f.write(f"# Tripsy Color Palette ({len(report)} named colors)\n\n")
+              for name in sorted(report.keys()):
+                  parts = [f"{app}: {v['hex']}" for app, v in sorted(report[name].items())]
+                  f.write(f"- **{name}**: {' | '.join(parts)}\n")
+          print(f"Tripsy colors: {len(report)} named, {len(colors)} entries total")
           PYEOF
 
-      - name: Extract color assets from Wanderlog
+      - name: Patch Tripsy binary for simulator (vtool + resign)
         run: |
-          cd /tmp/ipas
-          unzip -q "Wanderlog_v2.208.ipa" -d wanderlog_app
-          WL_APP=$(find /tmp/ipas/wanderlog_app/Payload -name "*.app" -maxdepth 1)
-          echo "WL_APP=$WL_APP" >> $GITHUB_ENV
-
-          mkdir -p /tmp/artifacts/wanderlog-colors
-          xcrun assetutil --info "$WL_APP/Assets.car" > /tmp/artifacts/wanderlog-colors/full_catalog.json 2>&1 || true
-          echo "Wanderlog catalog: $(wc -c < /tmp/artifacts/wanderlog-colors/full_catalog.json) bytes"
-
-          python3 << 'PYEOF'
-          import json, sys
-
-          with open("/tmp/artifacts/wanderlog-colors/full_catalog.json") as f:
-              content = f.read()
-          try:
-              data = json.loads(content)
-          except:
-              print("Could not parse wanderlog catalog")
-              sys.exit(0)
-
-          colors = [x for x in data if x.get("AssetType") == "Color"]
-          print(f"Wanderlog colors found: {len(colors)}")
-
-          color_report = {}
-          for c in colors:
-              name = c.get("Name", "unknown")
-              comps = c.get("Color", {}).get("components", {})
-              space = c.get("Color", {}).get("colorspace", "srgb")
-              appearance = c.get("Appearances", [{}])[0].get("Appearance", "Any")
-              if name not in color_report:
-                  color_report[name] = []
-              color_report[name].append({"space": space, "components": comps, "appearance": appearance})
-
-          with open("/tmp/artifacts/wanderlog-colors/colors.json", "w") as f:
-              json.dump(color_report, f, indent=2)
-
-          with open("/tmp/artifacts/wanderlog-colors/colors.md", "w") as f:
-              f.write("# Wanderlog Color Palette\n\n")
-              f.write(f"Total named colors: {len(color_report)}\n\n")
-              for name, variants in sorted(color_report.items()):
-                  f.write(f"## {name}\n")
-                  for v in variants:
-                      comps = v.get("components", {})
-                      r = comps.get("red", comps.get("r", "?"))
-                      g = comps.get("green", comps.get("g", "?"))
-                      b = comps.get("blue", comps.get("b", "?"))
-                      a = comps.get("alpha", comps.get("a", 1.0))
-                      f.write(f"- **{v.get('appearance','Any')}** ({v.get('space','srgb')}): R={r} G={g} B={b} A={a}\n")
-                  f.write("\n")
-          print("Done")
-          PYEOF
-
-      - name: Launch Tripsy in simulator + screenshot all screens
-        run: |
-          APP_PATH="${{ env.APP_PATH }}"
           SIM_ID="${{ env.SIM_ID }}"
-          mkdir -p /tmp/artifacts/tripsy-screenshots
+          APP_PATH="${{ env.APP_PATH }}"
 
-          # Open simulator UI
-          open -a Simulator
+          # Remove device-only extensions that can't run in sim
+          rm -rf "$APP_PATH/PlugIns" "$APP_PATH/Extensions" "$APP_PATH/Watch" 2>/dev/null || true
 
-          # Launch Tripsy
-          BUNDLE_ID="app.tripsy.ios"
-          xcrun simctl launch "$SIM_ID" "$BUNDLE_ID" 2>&1 || {
-            echo "Launch failed — trying to install+launch fresh"
-            # Re-extract + resign without PlugIns
-            APP_PATH_FRESH=$(find /tmp/ipas/tripsy_app/Payload -name "*.app" -maxdepth 1)
-            codesign -f -s - "$APP_PATH_FRESH"
-            xcrun simctl install "$SIM_ID" "$APP_PATH_FRESH"
-            xcrun simctl launch "$SIM_ID" "$BUNDLE_ID"
+          # vtool: patch every Mach-O binary from ios -> iossimulator platform
+          patch_macho() {
+            local f="$1"
+            if file "$f" 2>/dev/null | grep -qE "Mach-O (64-bit )?executable|Mach-O (64-bit )?dynamically"; then
+              vtool -set-build-version iossimulator 16.0 16.0 -replace -output "${f}.sim" "$f" 2>/dev/null \
+                && mv "${f}.sim" "$f" \
+                || echo "vtool skip: $f"
+            fi
           }
 
-          sleep 5
-          xcrun simctl io "$SIM_ID" screenshot /tmp/artifacts/tripsy-screenshots/01_launch.png
+          # Main binary (detect name = app name without .app)
+          APP_NAME=$(basename "$APP_PATH" .app)
+          patch_macho "$APP_PATH/$APP_NAME"
 
-          sleep 3
-          xcrun simctl io "$SIM_ID" screenshot /tmp/artifacts/tripsy-screenshots/02_onboarding.png
+          # All frameworks and dylibs
+          find "$APP_PATH/Frameworks" -type f 2>/dev/null | while read f; do patch_macho "$f"; done
 
-          # Let app settle
-          sleep 5
-          xcrun simctl io "$SIM_ID" screenshot /tmp/artifacts/tripsy-screenshots/03_main.png
+          # Strip all old signatures
+          find "$APP_PATH/Frameworks" -maxdepth 2 -type f -exec codesign --remove-signature {} \; 2>/dev/null || true
+          codesign --remove-signature "$APP_PATH/$APP_NAME" 2>/dev/null || true
+          codesign --remove-signature "$APP_PATH" 2>/dev/null || true
 
-          echo "Screenshots captured"
+          # Ad-hoc re-sign: frameworks first, then app
+          find "$APP_PATH/Frameworks" -maxdepth 1 \( -name "*.framework" -o -name "*.dylib" \) \
+            -exec codesign -f -s - {} \; 2>/dev/null || true
+          codesign -f -s - "$APP_PATH"
 
-      - name: Dump Tripsy app container (UserDefaults, CoreData, files)
+          # Install into simulator
+          xcrun simctl install "$SIM_ID" "$APP_PATH"
+          echo "Tripsy installed into $SIM_ID"
+
+      - name: Launch Tripsy + capture screenshots
         run: |
           SIM_ID="${{ env.SIM_ID }}"
-          mkdir -p /tmp/artifacts/tripsy-container
-
           BUNDLE_ID="app.tripsy.ios"
-          sleep 2
+          OUT="/tmp/artifacts/tripsy-screenshots"
+          mkdir -p "$OUT"
 
-          # Get container path
+          # Launch
+          echo "Launching Tripsy..."
+          xcrun simctl launch "$SIM_ID" "$BUNDLE_ID" 2>&1 || {
+            echo "Launch attempt 2 after reinstall..."
+            APP_PATH="${{ env.APP_PATH }}"
+            codesign -f -s - "$APP_PATH"
+            xcrun simctl install "$SIM_ID" "$APP_PATH"
+            xcrun simctl launch "$SIM_ID" "$BUNDLE_ID" 2>&1
+          }
+
+          SS() { xcrun simctl io "$SIM_ID" screenshot "$OUT/$1.png" 2>/dev/null && echo "screenshot: $1" || true; }
+          TAP() { xcrun simctl io "$SIM_ID" tap "$1" "$2" 2>/dev/null || true; }
+
+          sleep 4;  SS "01_launch"
+          sleep 3;  SS "02_t3"
+          sleep 3;  SS "03_t6"
+          sleep 4;  SS "04_t10"
+
+          # Tap center-bottom (Continue / Get Started / Sign In)
+          TAP 195 750; sleep 3; SS "05_tap1"
+          TAP 195 700; sleep 3; SS "06_tap2"
+          TAP 195 650; sleep 3; SS "07_tap3"
+
+          # Tap top-right (skip/close)
+          TAP 370 60;  sleep 3; SS "08_skip"
+
+          # Swipe up (scroll onboarding)
+          xcrun simctl io "$SIM_ID" swipe 195 600 195 200 2>/dev/null || true
+          sleep 2; SS "09_scroll1"
+
+          sleep 3; SS "10_final"
+
+          echo "Tripsy screenshots: $(ls $OUT/*.png 2>/dev/null | wc -l)"
+
+      - name: Dump Tripsy app container
+        run: |
+          SIM_ID="${{ env.SIM_ID }}"
+          BUNDLE_ID="app.tripsy.ios"
+          OUT="/tmp/artifacts/tripsy-container"
+          mkdir -p "$OUT"
+
           CONTAINER=$(xcrun simctl get_app_container "$SIM_ID" "$BUNDLE_ID" data 2>/dev/null || echo "")
           echo "Container: $CONTAINER"
 
           if [ -n "$CONTAINER" ]; then
-            # UserDefaults
+            # UserDefaults → JSON
             find "$CONTAINER/Library/Preferences" -name "*.plist" 2>/dev/null | while read f; do
               name=$(basename "$f")
-              plutil -convert json "$f" -o "/tmp/artifacts/tripsy-container/${name}.json" 2>/dev/null || cp "$f" "/tmp/artifacts/tripsy-container/$name"
+              plutil -convert json "$f" -o "$OUT/${name}.json" 2>/dev/null || cp "$f" "$OUT/$name"
             done
-
-            # CoreData sqlite
-            find "$CONTAINER" -name "*.sqlite*" 2>/dev/null | while read f; do
-              cp "$f" "/tmp/artifacts/tripsy-container/" 2>/dev/null
-            done
-
-            # List all files
-            find "$CONTAINER" -type f 2>/dev/null | sed "s|$CONTAINER/||" > /tmp/artifacts/tripsy-container/file_tree.txt
-            echo "Container tree saved ($(wc -l < /tmp/artifacts/tripsy-container/file_tree.txt) files)"
+            # CoreData sqlite files
+            find "$CONTAINER" -name "*.sqlite*" 2>/dev/null -exec cp {} "$OUT/" \;
+            # File tree
+            find "$CONTAINER" -type f 2>/dev/null | sed "s|$CONTAINER/||" > "$OUT/file_tree.txt"
+            echo "Container: $(wc -l < $OUT/file_tree.txt) files"
           else
-            echo "No container found (app may not have launched)"
+            echo "No container (app may not have launched successfully)"
           fi
 
-      - name: Capture Tripsy network traffic via proxy
+      # ─── WANDERLOG ─────────────────────────────────────────────────────────
+
+      - name: Extract Wanderlog IPA
         run: |
           SIM_ID="${{ env.SIM_ID }}"
-          mkdir -p /tmp/artifacts/tripsy-network
+          cd /tmp/ipas
+          unzip -q "Wanderlog_v2.208.ipa" -d wanderlog_app
+          WL_APP=$(find /tmp/ipas/wanderlog_app/Payload -name "*.app" -maxdepth 1 -type d)
+          echo "WL_APP=$WL_APP" >> $GITHUB_ENV
+          echo "Wanderlog app: $WL_APP"
+          ls "$WL_APP" | head -20
 
-          # Use mitmproxy to capture traffic
-          pip3 install mitmproxy --quiet 2>/dev/null || pip install mitmproxy --quiet
-
-          # Set simulator proxy
-          xcrun simctl keychain "$SIM_ID" add-root-cert ~/.mitmproxy/mitmproxy-ca-cert.pem 2>/dev/null || true
-
-          # Start mitmdump in background
-          mitmdump -p 8888 --save-stream-file /tmp/artifacts/tripsy-network/traffic.mitm \
-            --set flow_detail=3 -q &
-          MITM_PID=$!
-          echo "mitmproxy PID: $MITM_PID"
-
-          # Point simulator at proxy
-          # Network proxy for simulator via environment
-          defaults write com.apple.CoreSimulator SimulatorHTTPProxy "http://127.0.0.1:8888" 2>/dev/null || true
-
-          BUNDLE_ID="app.tripsy.ios"
-          xcrun simctl launch "$SIM_ID" "$BUNDLE_ID" || true
-          sleep 20
-
-          kill $MITM_PID 2>/dev/null || true
-
-          # Convert to readable JSON
-          mitmdump -r /tmp/artifacts/tripsy-network/traffic.mitm \
-            --set flow_detail=2 -q 2>/dev/null | head -1000 > /tmp/artifacts/tripsy-network/traffic.txt || true
-
-          echo "Network capture done"
-
-      - name: Extract Tripsy CoreData schema via sqlite
+      - name: Extract Wanderlog color assets
         run: |
-          mkdir -p /tmp/artifacts/tripsy-db
-          # Check container for sqlite files
+          WL_APP="${{ env.WL_APP }}"
+          mkdir -p /tmp/artifacts/wanderlog-colors
+          if [ -f "$WL_APP/Assets.car" ]; then
+            xcrun assetutil --info "$WL_APP/Assets.car" \
+              > /tmp/artifacts/wanderlog-colors/full_catalog.json 2>&1 || true
+          else
+            echo "No Assets.car in Wanderlog (RN app — colors live in JS bundle)" \
+              > /tmp/artifacts/wanderlog-colors/note.txt
+            echo "[]" > /tmp/artifacts/wanderlog-colors/full_catalog.json
+          fi
+          python3 << 'PYEOF'
+          import json
+          raw = open("/tmp/artifacts/wanderlog-colors/full_catalog.json").read()
+          idx = raw.find('[')
+          data = json.loads(raw[idx:]) if idx >= 0 else []
+          colors = [x for x in data if x.get("AssetType") == "Color"]
+          print(f"Wanderlog .car colors: {len(colors)} (RN uses JS bundle for colors)")
+          PYEOF
+
+      - name: Patch Wanderlog binary for simulator (vtool + resign)
+        run: |
           SIM_ID="${{ env.SIM_ID }}"
-          BUNDLE_ID="app.tripsy.ios"
+          WL_APP="${{ env.WL_APP }}"
+
+          # Terminate Tripsy
+          xcrun simctl terminate "$SIM_ID" "app.tripsy.ios" 2>/dev/null || true
+          sleep 2
+
+          rm -rf "$WL_APP/PlugIns" "$WL_APP/Extensions" 2>/dev/null || true
+
+          patch_macho() {
+            local f="$1"
+            if file "$f" 2>/dev/null | grep -qE "Mach-O (64-bit )?executable|Mach-O (64-bit )?dynamically"; then
+              vtool -set-build-version iossimulator 16.0 16.0 -replace -output "${f}.sim" "$f" 2>/dev/null \
+                && mv "${f}.sim" "$f" \
+                || echo "vtool skip: $f"
+            fi
+          }
+
+          # Wanderlog main binary name
+          APP_NAME=$(basename "$WL_APP" .app)
+          patch_macho "$WL_APP/$APP_NAME"
+
+          find "$WL_APP/Frameworks" -type f 2>/dev/null | while read f; do patch_macho "$f"; done
+
+          find "$WL_APP/Frameworks" -maxdepth 2 -type f -exec codesign --remove-signature {} \; 2>/dev/null || true
+          codesign --remove-signature "$WL_APP/$APP_NAME" 2>/dev/null || true
+          codesign --remove-signature "$WL_APP" 2>/dev/null || true
+
+          find "$WL_APP/Frameworks" -maxdepth 1 \( -name "*.framework" -o -name "*.dylib" \) \
+            -exec codesign -f -s - {} \; 2>/dev/null || true
+          codesign -f -s - "$WL_APP"
+
+          xcrun simctl install "$SIM_ID" "$WL_APP"
+          echo "Wanderlog installed"
+
+      - name: Launch Wanderlog + capture screenshots
+        run: |
+          SIM_ID="${{ env.SIM_ID }}"
+          BUNDLE_ID="com.wanderlog.ios"
+          OUT="/tmp/artifacts/wanderlog-screenshots"
+          mkdir -p "$OUT"
+
+          echo "Launching Wanderlog..."
+          xcrun simctl launch "$SIM_ID" "$BUNDLE_ID" 2>&1 || {
+            echo "Launch attempt 2..."
+            WL_APP="${{ env.WL_APP }}"
+            codesign -f -s - "$WL_APP"
+            xcrun simctl install "$SIM_ID" "$WL_APP"
+            xcrun simctl launch "$SIM_ID" "$BUNDLE_ID" 2>&1
+          }
+
+          SS() { xcrun simctl io "$SIM_ID" screenshot "$OUT/$1.png" 2>/dev/null && echo "screenshot: $1" || true; }
+          TAP() { xcrun simctl io "$SIM_ID" tap "$1" "$2" 2>/dev/null || true; }
+
+          sleep 5;  SS "01_launch"
+          sleep 4;  SS "02_t5"
+          sleep 4;  SS "03_t9"
+          sleep 3;  SS "04_t12"
+
+          # Tap Continue / Get Started
+          TAP 195 750; sleep 4; SS "05_tap1"
+          TAP 195 700; sleep 4; SS "06_tap2"
+          TAP 195 650; sleep 3; SS "07_tap3"
+
+          # Close/skip buttons
+          TAP 370 60;  sleep 3; SS "08_skip"
+          TAP 30  60;  sleep 3; SS "09_back"
+
+          xcrun simctl io "$SIM_ID" swipe 195 600 195 200 2>/dev/null || true
+          sleep 2; SS "10_scroll1"
+
+          sleep 3; SS "11_final"
+
+          echo "Wanderlog screenshots: $(ls $OUT/*.png 2>/dev/null | wc -l)"
+
+      - name: Dump Wanderlog app container
+        run: |
+          SIM_ID="${{ env.SIM_ID }}"
+          BUNDLE_ID="com.wanderlog.ios"
+          OUT="/tmp/artifacts/wanderlog-container"
+          mkdir -p "$OUT"
+
           CONTAINER=$(xcrun simctl get_app_container "$SIM_ID" "$BUNDLE_ID" data 2>/dev/null || echo "")
+          echo "Container: $CONTAINER"
 
           if [ -n "$CONTAINER" ]; then
-            find "$CONTAINER" -name "*.sqlite" 2>/dev/null | while read db; do
-              name=$(basename "$db")
-              echo "=== Schema: $name ===" >> /tmp/artifacts/tripsy-db/schema.sql
-              sqlite3 "$db" ".schema" >> /tmp/artifacts/tripsy-db/schema.sql 2>/dev/null || true
-              echo "=== Tables: $name ===" >> /tmp/artifacts/tripsy-db/schema.sql
-              sqlite3 "$db" ".tables" >> /tmp/artifacts/tripsy-db/schema.sql 2>/dev/null || true
+            find "$CONTAINER/Library/Preferences" -name "*.plist" 2>/dev/null | while read f; do
+              name=$(basename "$f")
+              plutil -convert json "$f" -o "$OUT/${name}.json" 2>/dev/null || cp "$f" "$OUT/$name"
             done
+            find "$CONTAINER" -name "*.sqlite*" 2>/dev/null -exec cp {} "$OUT/" \;
+            find "$CONTAINER" -type f 2>/dev/null | sed "s|$CONTAINER/||" > "$OUT/file_tree.txt"
+            echo "Wanderlog container: $(wc -l < $OUT/file_tree.txt) files"
+          else
+            echo "No container found"
           fi
 
-      - name: Upload tripsy artifacts
+      # ─── NETWORK CAPTURE ───────────────────────────────────────────────────
+
+      - name: Setup mitmproxy + capture network for both apps
+        run: |
+          pip3 install mitmproxy --quiet 2>&1 | tail -3
+
+          mkdir -p /tmp/artifacts/network
+
+          # Generate mitmproxy cert
+          mitmdump -p 8889 --set block_global=false &
+          MPID=$!; sleep 6; kill $MPID 2>/dev/null || true
+
+          # Trust cert in simulator
+          SIM_ID="${{ env.SIM_ID }}"
+          xcrun simctl keychain "$SIM_ID" add-root-cert ~/.mitmproxy/mitmproxy-ca-cert.pem 2>/dev/null || true
+          echo "mitmproxy cert trusted"
+
+          # Configure simulator system proxy
+          xcrun simctl spawn "$SIM_ID" defaults write NSGlobalDomain \
+            NSURLConnectionProxyDictionary \
+            -dict HTTPEnable -bool YES HTTPProxy "127.0.0.1" HTTPPort -int 8888 \
+            HTTPSEnable -bool YES HTTPSProxy "127.0.0.1" HTTPSPort -int 8888 2>/dev/null || true
+
+          # ── Capture Tripsy traffic ──
+          mitmdump -p 8888 \
+            --save-stream-file /tmp/artifacts/network/tripsy_traffic.mitm \
+            --set flow_detail=1 -q &
+          MPID=$!
+
+          xcrun simctl launch "$SIM_ID" "app.tripsy.ios" 2>/dev/null || true
+          sleep 30
+
+          kill $MPID 2>/dev/null; sleep 2
+
+          # ── Capture Wanderlog traffic ──
+          xcrun simctl terminate "$SIM_ID" "app.tripsy.ios" 2>/dev/null || true
+          sleep 2
+
+          mitmdump -p 8888 \
+            --save-stream-file /tmp/artifacts/network/wanderlog_traffic.mitm \
+            --set flow_detail=1 -q &
+          MPID=$!
+
+          xcrun simctl launch "$SIM_ID" "com.wanderlog.ios" 2>/dev/null || true
+          sleep 30
+
+          kill $MPID 2>/dev/null; sleep 2
+
+          # ── Parse captured flows ──
+          python3 << 'PYEOF'
+          import json, os
+
+          def parse_flows(mitm_path, out_path):
+              try:
+                  from mitmproxy import io as mio, http
+                  flows = []
+                  with open(mitm_path, "rb") as f:
+                      for flow in mio.FlowReader(f).stream():
+                          if isinstance(flow, http.HTTPFlow):
+                              req, resp = flow.request, flow.response
+                              flows.append({
+                                  "method": req.method,
+                                  "url": req.pretty_url,
+                                  "req_headers": dict(req.headers),
+                                  "req_body": req.text[:3000] if req.content else None,
+                                  "status": resp.status_code if resp else None,
+                                  "resp_headers": dict(resp.headers) if resp else {},
+                                  "resp_body": resp.text[:5000] if resp and resp.content else None,
+                              })
+                  with open(out_path, "w") as f:
+                      json.dump(flows, f, indent=2)
+                  print(f"{mitm_path}: {len(flows)} flows captured")
+              except Exception as e:
+                  print(f"Parse error for {mitm_path}: {e}")
+
+          for app, fname in [("tripsy", "tripsy_traffic"), ("wanderlog", "wanderlog_traffic")]:
+              mitm = f"/tmp/artifacts/network/{fname}.mitm"
+              out  = f"/tmp/artifacts/network/{fname}.json"
+              if os.path.exists(mitm):
+                  parse_flows(mitm, out)
+              else:
+                  print(f"No capture file: {mitm}")
+          PYEOF
+
+      # ─── UPLOAD ────────────────────────────────────────────────────────────
+
+      - name: List all artifacts
+        if: always()
+        run: |
+          echo "=== Artifacts collected ==="
+          find /tmp/artifacts -type f | sort
+          echo ""
+          echo "=== Screenshot count ==="
+          ls /tmp/artifacts/tripsy-screenshots/*.png 2>/dev/null | wc -l || echo "0"
+          ls /tmp/artifacts/wanderlog-screenshots/*.png 2>/dev/null | wc -l || echo "0"
+
+      - name: Upload tripsy-dynamic artifacts
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: tripsy-dynamic
-          path: /tmp/artifacts/tripsy-*
+          path: |
+            /tmp/artifacts/tripsy-*
           retention-days: 30
 
-      - name: Upload wanderlog artifacts
+      - name: Upload wanderlog-dynamic artifacts
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: wanderlog-dynamic
-          path: /tmp/artifacts/wanderlog-*
+          path: |
+            /tmp/artifacts/wanderlog-*
+          retention-days: 30
+
+      - name: Upload network artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: network-capture
+          path: /tmp/artifacts/network/
           retention-days: 30
