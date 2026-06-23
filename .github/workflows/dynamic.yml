@@ -155,25 +155,33 @@ jobs:
 
           SS() { xcrun simctl io "$SIM_ID" screenshot "$OUT/$1.png" 2>/dev/null && echo "screenshot: $1" || true; }
           TAP() { xcrun simctl io "$SIM_ID" tap "$1" "$2" 2>/dev/null || true; }
+          SWIPE() { xcrun simctl io "$SIM_ID" swipe "$1" "$2" "$3" "$4" 2>/dev/null || true; }
 
-          sleep 4;  SS "01_launch"
-          sleep 3;  SS "02_t3"
-          sleep 3;  SS "03_t6"
-          sleep 4;  SS "04_t10"
+          # Wait for app to fully load (heavy Swift app, first launch)
+          sleep 8;  SS "01_launch"
+          sleep 4;  SS "02_t4"
+          sleep 3;  SS "03_t7"
 
-          # Tap center-bottom (Continue / Get Started / Sign In)
-          TAP 195 750; sleep 3; SS "05_tap1"
-          TAP 195 700; sleep 3; SS "06_tap2"
-          TAP 195 650; sleep 3; SS "07_tap3"
+          # Tripsy onboarding: "Get Started" button is bottom-center ~y=750
+          TAP 195 750; sleep 5; SS "04_tap_getstarted"
 
-          # Tap top-right (skip/close)
-          TAP 370 60;  sleep 3; SS "08_skip"
+          # "Continue" / "Next" on onboarding carousel — center bottom
+          TAP 195 720; sleep 4; SS "05_tap2"
+          TAP 195 720; sleep 4; SS "06_tap3"
+          TAP 195 720; sleep 4; SS "07_tap4"
 
-          # Swipe up (scroll onboarding)
-          xcrun simctl io "$SIM_ID" swipe 195 600 195 200 2>/dev/null || true
-          sleep 2; SS "09_scroll1"
+          # Skip / X button — top right corner
+          TAP 370 55;  sleep 3; SS "08_skip_topright"
+          # Also try top left back button
+          TAP 25 55;   sleep 3; SS "09_back_topleft"
 
-          sleep 3; SS "10_final"
+          # Swipe left (onboarding carousel)
+          SWIPE 350 400 50 400; sleep 3; SS "10_swipe_left"
+
+          # Swipe up (scroll content)
+          SWIPE 195 600 195 200; sleep 3; SS "11_scroll_up"
+
+          sleep 4; SS "12_final"
 
           echo "Tripsy screenshots: $(ls $OUT/*.png 2>/dev/null | wc -l)"
 
@@ -297,25 +305,31 @@ jobs:
 
           SS() { xcrun simctl io "$SIM_ID" screenshot "$OUT/$1.png" 2>/dev/null && echo "screenshot: $1" || true; }
           TAP() { xcrun simctl io "$SIM_ID" tap "$1" "$2" 2>/dev/null || true; }
+          SWIPE() { xcrun simctl io "$SIM_ID" swipe "$1" "$2" "$3" "$4" 2>/dev/null || true; }
 
-          sleep 5;  SS "01_launch"
-          sleep 4;  SS "02_t5"
-          sleep 4;  SS "03_t9"
-          sleep 3;  SS "04_t12"
+          # Wait for Wanderlog (RN/Hermes app, heavy JS bundle)
+          sleep 10; SS "01_launch"
+          sleep 4;  SS "02_t4"
+          sleep 3;  SS "03_t7"
 
-          # Tap Continue / Get Started
-          TAP 195 750; sleep 4; SS "05_tap1"
-          TAP 195 700; sleep 4; SS "06_tap2"
-          TAP 195 650; sleep 3; SS "07_tap3"
+          # Wanderlog onboarding: "Get Started" / "Continue" bottom center
+          TAP 195 750; sleep 5; SS "04_tap_getstarted"
+          TAP 195 720; sleep 4; SS "05_tap2"
+          TAP 195 720; sleep 4; SS "06_tap3"
+          TAP 195 720; sleep 4; SS "07_tap4"
 
-          # Close/skip buttons
-          TAP 370 60;  sleep 3; SS "08_skip"
-          TAP 30  60;  sleep 3; SS "09_back"
+          # Skip / X — top right
+          TAP 370 55;  sleep 3; SS "08_skip_topright"
+          # Back — top left
+          TAP 25 55;   sleep 3; SS "09_back_topleft"
 
-          xcrun simctl io "$SIM_ID" swipe 195 600 195 200 2>/dev/null || true
-          sleep 2; SS "10_scroll1"
+          # Swipe left (carousel)
+          SWIPE 350 400 50 400; sleep 3; SS "10_swipe_left"
 
-          sleep 3; SS "11_final"
+          # Swipe up (scroll)
+          SWIPE 195 600 195 200; sleep 3; SS "11_scroll_up"
+
+          sleep 4; SS "12_final"
 
           echo "Wanderlog screenshots: $(ls $OUT/*.png 2>/dev/null | wc -l)"
 
