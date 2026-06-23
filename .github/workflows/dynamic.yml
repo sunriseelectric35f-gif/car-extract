@@ -343,57 +343,130 @@ jobs:
 
       # ─── NETWORK CAPTURE ───────────────────────────────────────────────────
 
-      - name: Setup mitmproxy + capture network for both apps
+      - name: Setup mitmproxy cert + simulator proxy
         run: |
           pip3 install mitmproxy --quiet --break-system-packages 2>&1 | tail -3
-
           mkdir -p /tmp/artifacts/network
 
-          # Generate mitmproxy cert
+          # Generate CA cert by running mitmdump briefly
           mitmdump -p 8889 --set block_global=false &
-          MPID=$!; sleep 6; kill $MPID 2>/dev/null || true
+          MPID=$!; sleep 8; kill $MPID 2>/dev/null || true
+          ls -lh ~/.mitmproxy/
 
-          # Trust cert in simulator
+          # Trust CA in simulator BEFORE any app launch
           SIM_ID="${{ env.SIM_ID }}"
-          xcrun simctl keychain "$SIM_ID" add-root-cert ~/.mitmproxy/mitmproxy-ca-cert.pem 2>/dev/null || true
-          echo "mitmproxy cert trusted"
+          xcrun simctl keychain "$SIM_ID" add-root-cert ~/.mitmproxy/mitmproxy-ca-cert.pem
+          echo "mitmproxy CA trusted"
 
-          # Configure simulator system proxy
-          xcrun simctl spawn "$SIM_ID" defaults write NSGlobalDomain \
-            NSURLConnectionProxyDictionary \
-            -dict HTTPEnable -bool YES HTTPProxy "127.0.0.1" HTTPPort -int 8888 \
-            HTTPSEnable -bool YES HTTPSProxy "127.0.0.1" HTTPSPort -int 8888 2>/dev/null || true
+          # Set proxy via simctl environment (affects all launched processes)
+          # Store in GITHUB_ENV so subsequent steps inherit
+          echo "MITM_PORT=8888" >> $GITHUB_ENV
 
-          # ── Capture Tripsy traffic ──
+      - name: Build SSL kill-switch dylib
+        run: |
+          # Minimal dylib that no-ops TLS cert validation in simulator
+          cat > /tmp/ssl_killswitch.m << 'CEOF'
+          #include <Security/Security.h>
+          Boolean SecTrustEvaluateWithError(SecTrustRef t, CFErrorRef *e) {
+              if (e) *e = NULL; return true;
+          }
+          OSStatus SecTrustEvaluate(SecTrustRef t, SecTrustResultType *r) {
+              if (r) *r = kSecTrustResultProceed; return 0;
+          }
+          CEOF
+
+          SDK=$(xcrun --sdk iphonesimulator --show-sdk-path)
+          clang -arch arm64 -dynamiclib \
+            -target arm64-apple-ios16.0-simulator \
+            -isysroot "$SDK" \
+            -framework Security \
+            -o /tmp/ssl_killswitch.dylib \
+            /tmp/ssl_killswitch.m 2>&1 \
+          && echo "SSL kill-switch built OK" \
+          || echo "Build failed — will run without SSL bypass"
+          ls -lh /tmp/ssl_killswitch.dylib 2>/dev/null || true
+
+      - name: Capture Tripsy network traffic
+        run: |
+          SIM_ID="${{ env.SIM_ID }}"
+          xcrun simctl terminate "$SIM_ID" "app.tripsy.ios" 2>/dev/null || true
+          sleep 2
+
+          # Start mitmproxy
           mitmdump -p 8888 \
             --save-stream-file /tmp/artifacts/network/tripsy_traffic.mitm \
-            --set flow_detail=1 -q &
-          MPID=$!
+            --set block_global=false -q &
+          MPID=$!; sleep 3
 
-          xcrun simctl launch "$SIM_ID" "app.tripsy.ios" 2>/dev/null || true
-          sleep 30
+          # Launch with proxy env vars + SSL bypass dylib
+          if [ -f /tmp/ssl_killswitch.dylib ]; then
+            xcrun simctl launch --terminate-running-process \
+              "$SIM_ID" "app.tripsy.ios" \
+              DYLD_INSERT_LIBRARIES=/tmp/ssl_killswitch.dylib \
+              https_proxy=http://127.0.0.1:8888 \
+              http_proxy=http://127.0.0.1:8888 2>&1 || \
+            xcrun simctl launch --terminate-running-process \
+              "$SIM_ID" "app.tripsy.ios" \
+              https_proxy=http://127.0.0.1:8888 \
+              http_proxy=http://127.0.0.1:8888 2>&1 || true
+          else
+            xcrun simctl launch --terminate-running-process \
+              "$SIM_ID" "app.tripsy.ios" \
+              https_proxy=http://127.0.0.1:8888 \
+              http_proxy=http://127.0.0.1:8888 2>&1 || true
+          fi
 
+          echo "Capturing Tripsy traffic for 45s..."
+          sleep 45
           kill $MPID 2>/dev/null; sleep 2
+          echo "Tripsy .mitm: $(wc -c < /tmp/artifacts/network/tripsy_traffic.mitm 2>/dev/null || echo 0) bytes"
 
-          # ── Capture Wanderlog traffic ──
+      - name: Capture Wanderlog network traffic
+        run: |
+          SIM_ID="${{ env.SIM_ID }}"
           xcrun simctl terminate "$SIM_ID" "app.tripsy.ios" 2>/dev/null || true
+          xcrun simctl terminate "$SIM_ID" "com.wanderlog.ios" 2>/dev/null || true
           sleep 2
 
           mitmdump -p 8888 \
             --save-stream-file /tmp/artifacts/network/wanderlog_traffic.mitm \
-            --set flow_detail=1 -q &
-          MPID=$!
+            --set block_global=false -q &
+          MPID=$!; sleep 3
 
-          xcrun simctl launch "$SIM_ID" "com.wanderlog.ios" 2>/dev/null || true
-          sleep 30
+          if [ -f /tmp/ssl_killswitch.dylib ]; then
+            xcrun simctl launch --terminate-running-process \
+              "$SIM_ID" "com.wanderlog.ios" \
+              DYLD_INSERT_LIBRARIES=/tmp/ssl_killswitch.dylib \
+              https_proxy=http://127.0.0.1:8888 \
+              http_proxy=http://127.0.0.1:8888 2>&1 || \
+            xcrun simctl launch --terminate-running-process \
+              "$SIM_ID" "com.wanderlog.ios" \
+              https_proxy=http://127.0.0.1:8888 \
+              http_proxy=http://127.0.0.1:8888 2>&1 || true
+          else
+            xcrun simctl launch --terminate-running-process \
+              "$SIM_ID" "com.wanderlog.ios" \
+              https_proxy=http://127.0.0.1:8888 \
+              http_proxy=http://127.0.0.1:8888 2>&1 || true
+          fi
 
+          echo "Capturing Wanderlog traffic for 45s..."
+          sleep 45
           kill $MPID 2>/dev/null; sleep 2
+          echo "Wanderlog .mitm: $(wc -c < /tmp/artifacts/network/wanderlog_traffic.mitm 2>/dev/null || echo 0) bytes"
 
-          # ── Parse captured flows ──
+      - name: Parse network flows to JSON
+        if: always()
+        run: |
           python3 << 'PYEOF'
           import json, os
 
           def parse_flows(mitm_path, out_path):
+              size = os.path.getsize(mitm_path) if os.path.exists(mitm_path) else 0
+              print(f"{os.path.basename(mitm_path)}: {size} bytes")
+              if size == 0:
+                  with open(out_path, "w") as f: json.dump([], f)
+                  return
               try:
                   from mitmproxy import io as mio, http
                   flows = []
@@ -412,17 +485,16 @@ jobs:
                               })
                   with open(out_path, "w") as f:
                       json.dump(flows, f, indent=2)
-                  print(f"{mitm_path}: {len(flows)} flows captured")
+                  print(f"  -> {len(flows)} flows")
               except Exception as e:
-                  print(f"Parse error for {mitm_path}: {e}")
+                  print(f"  -> parse error: {e}")
+                  with open(out_path, "w") as f: json.dump([], f)
 
-          for app, fname in [("tripsy", "tripsy_traffic"), ("wanderlog", "wanderlog_traffic")]:
-              mitm = f"/tmp/artifacts/network/{fname}.mitm"
-              out  = f"/tmp/artifacts/network/{fname}.json"
-              if os.path.exists(mitm):
-                  parse_flows(mitm, out)
-              else:
-                  print(f"No capture file: {mitm}")
+          for fname in ["tripsy_traffic", "wanderlog_traffic"]:
+              parse_flows(
+                  f"/tmp/artifacts/network/{fname}.mitm",
+                  f"/tmp/artifacts/network/{fname}.json",
+              )
           PYEOF
 
       # ─── UPLOAD ────────────────────────────────────────────────────────────
