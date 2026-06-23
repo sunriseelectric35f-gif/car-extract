@@ -124,136 +124,152 @@ jobs:
           print(f"Extracted {len(out)} Tripsy colors")
           PYEOF
 
-      - name: Write Tripsy Maestro flow
+      - name: Launch Tripsy + run Maestro flow
         run: |
-          mkdir -p /tmp/maestro
-          cat > /tmp/maestro/tripsy_flow.yaml << 'FLOWEOF'
-          appId: app.tripsy.ios
-          ---
-          - launchApp:
-              appId: app.tripsy.ios
-              clearState: false
-          - waitForAnimationToEnd:
-              timeout: 12000
-          - takeScreenshot: tripsy_01_launch
+          SIM_ID="${{ env.SIM_ID }}"
+          BUNDLE_ID="app.tripsy.ios"
+          OUT="/tmp/artifacts/tripsy-screenshots"
+          mkdir -p "$OUT" /tmp/maestro
 
-          # Dismiss any permission dialogs
-          - runFlow:
-              when:
-                visible: "Allow"
-              commands:
-                - tapOn: "Allow"
-                - waitForAnimationToEnd
-          - runFlow:
-              when:
-                visible: "Continue"
-              commands:
-                - takeScreenshot: tripsy_02_pre_continue
-                - tapOn: "Continue"
-                - waitForAnimationToEnd: {timeout: 4000}
-          - takeScreenshot: tripsy_03_after_continue
+          # Launch via simctl (reliable — doesn't need XCTest signing)
+          echo "Launching Tripsy..."
+          xcrun simctl launch "$SIM_ID" "$BUNDLE_ID" 2>&1 || true
+          # Wait for app to fully render (Swift app, first cold boot)
+          sleep 18
 
-          # Get Started / onboarding entry
-          - runFlow:
-              when:
-                visible: "Get Started"
-              commands:
-                - takeScreenshot: tripsy_04_getstarted_visible
-                - tapOn: "Get Started"
-                - waitForAnimationToEnd: {timeout: 5000}
-                - takeScreenshot: tripsy_05_after_getstarted
+          # Check if app process is alive
+          xcrun simctl spawn "$SIM_ID" launchctl list 2>/dev/null | grep tripsy || echo "tripsy not in launchctl"
 
-          # Onboarding slides — tap Next/Continue up to 6 times
-          - repeat:
-              times: 6
-              commands:
-                - runFlow:
-                    when:
-                      visible: "Next"
-                    commands:
-                      - tapOn: "Next"
-                      - waitForAnimationToEnd: {timeout: 3000}
-                      - takeScreenshot: tripsy_slide_next
-                - runFlow:
-                    when:
-                      visible: "Continue"
-                    commands:
-                      - tapOn: "Continue"
-                      - waitForAnimationToEnd: {timeout: 3000}
-                      - takeScreenshot: tripsy_slide_continue
+          # Capture launch screenshot via simctl (before Maestro touches anything)
+          xcrun simctl io "$SIM_ID" screenshot "$OUT/00_launch_raw.png" 2>/dev/null || true
 
-          # Skip sign-in if visible
-          - runFlow:
-              when:
-                visible: "Skip"
-              commands:
-                - takeScreenshot: tripsy_skip_visible
-                - tapOn: "Skip"
-                - waitForAnimationToEnd: {timeout: 3000}
+          # Write Maestro flow via Python — avoids YAML heredoc conflicts
+          python3 << 'PYEOF'
+flow = """appId: app.tripsy.ios
+---
+- waitForAnimationToEnd:
+    timeout: 5000
+- takeScreenshot: tripsy_01_initial
 
-          - runFlow:
-              when:
-                visible: "Maybe Later"
-              commands:
-                - tapOn: "Maybe Later"
-                - waitForAnimationToEnd
+- runFlow:
+    when:
+      visible: "Allow"
+    commands:
+      - tapOn: "Allow"
+      - waitForAnimationToEnd
 
-          - takeScreenshot: tripsy_06_post_onboarding
+- runFlow:
+    when:
+      visible: "OK"
+    commands:
+      - tapOn: "OK"
+      - waitForAnimationToEnd
 
-          # Explore main tabs — tap each tab bar item
-          - runFlow:
-              when:
-                visible: "Trips"
-              commands:
-                - tapOn: "Trips"
-                - waitForAnimationToEnd: {timeout: 3000}
-                - takeScreenshot: tripsy_07_trips_tab
+- takeScreenshot: tripsy_02_permissions_done
 
-          - runFlow:
-              when:
-                visible: "Explore"
-              commands:
-                - tapOn: "Explore"
-                - waitForAnimationToEnd: {timeout: 3000}
-                - takeScreenshot: tripsy_08_explore_tab
+- runFlow:
+    when:
+      visible: "Get Started"
+    commands:
+      - tapOn: "Get Started"
+      - waitForAnimationToEnd:
+          timeout: 5000
+      - takeScreenshot: tripsy_03_after_getstarted
 
-          - runFlow:
-              when:
-                visible: "Today"
-              commands:
-                - tapOn: "Today"
-                - waitForAnimationToEnd: {timeout: 3000}
-                - takeScreenshot: tripsy_09_today_tab
+- repeat:
+    times: 8
+    commands:
+      - runFlow:
+          when:
+            visible: "Next"
+          commands:
+            - tapOn: "Next"
+            - waitForAnimationToEnd:
+                timeout: 3000
+            - takeScreenshot: tripsy_slide_next
+      - runFlow:
+          when:
+            visible: "Continue"
+          commands:
+            - tapOn: "Continue"
+            - waitForAnimationToEnd:
+                timeout: 3000
+            - takeScreenshot: tripsy_slide_continue
 
-          - runFlow:
-              when:
-                visible: "Settings"
-              commands:
-                - tapOn: "Settings"
-                - waitForAnimationToEnd: {timeout: 3000}
-                - takeScreenshot: tripsy_10_settings_tab
+- runFlow:
+    when:
+      visible: "Skip"
+    commands:
+      - tapOn: "Skip"
+      - waitForAnimationToEnd:
+          timeout: 3000
+      - takeScreenshot: tripsy_skip
 
-          # Try to create a trip
-          - runFlow:
-              when:
-                visible: "New Trip"
-              commands:
-                - tapOn: "New Trip"
-                - waitForAnimationToEnd: {timeout: 3000}
-                - takeScreenshot: tripsy_11_new_trip
-                - tapOn: "Cancel"
+- runFlow:
+    when:
+      visible: "Maybe Later"
+    commands:
+      - tapOn: "Maybe Later"
+      - waitForAnimationToEnd
 
-          - takeScreenshot: tripsy_12_final
-          FLOWEOF
+- takeScreenshot: tripsy_04_post_onboarding
 
-      - name: Run Tripsy Maestro flow
-        run: |
-          mkdir -p /tmp/artifacts/tripsy-screenshots
-          maestro --device "${{ env.SIM_ID }}" test \
-            --output /tmp/artifacts/tripsy-screenshots \
-            /tmp/maestro/tripsy_flow.yaml \
-            2>&1 | tee /tmp/artifacts/tripsy-screenshots/maestro_log.txt || true
-          echo "Screenshots: $(ls /tmp/artifacts/tripsy-screenshots/*.png 2>/dev/null | wc -l)"
+- runFlow:
+    when:
+      visible: "Trips"
+    commands:
+      - tapOn: "Trips"
+      - waitForAnimationToEnd:
+          timeout: 3000
+      - takeScreenshot: tripsy_05_trips_tab
+
+- runFlow:
+    when:
+      visible: "Explore"
+    commands:
+      - tapOn: "Explore"
+      - waitForAnimationToEnd:
+          timeout: 3000
+      - takeScreenshot: tripsy_06_explore_tab
+
+- runFlow:
+    when:
+      visible: "Today"
+    commands:
+      - tapOn: "Today"
+      - waitForAnimationToEnd:
+          timeout: 3000
+      - takeScreenshot: tripsy_07_today_tab
+
+- runFlow:
+    when:
+      visible: "Settings"
+    commands:
+      - tapOn: "Settings"
+      - waitForAnimationToEnd:
+          timeout: 3000
+      - takeScreenshot: tripsy_08_settings
+
+- takeScreenshot: tripsy_09_final
+"""
+with open("/tmp/maestro/tripsy_flow.yaml", "w") as f:
+    f.write(flow)
+print("Tripsy flow written")
+PYEOF
+
+          # Run Maestro against the already-running app
+          maestro --device "$SIM_ID" test /tmp/maestro/tripsy_flow.yaml \
+            2>&1 | tee "$OUT/maestro_log.txt" || true
+
+          # Maestro saves screenshots to ~/.maestro/tests/<timestamp>/
+          MAESTRO_OUT=$(ls -td ~/.maestro/tests/*/ 2>/dev/null | head -1)
+          if [ -n "$MAESTRO_OUT" ]; then
+            echo "Maestro output dir: $MAESTRO_OUT"
+            ls "$MAESTRO_OUT" || true
+            find "$MAESTRO_OUT" -name "*.png" -exec cp {} "$OUT/" \; 2>/dev/null || true
+          fi
+
+          echo "Total screenshots: $(ls $OUT/*.png 2>/dev/null | wc -l)"
 
       - name: Dump Tripsy container
         run: |
@@ -319,143 +335,158 @@ jobs:
           xcrun simctl install "$SIM_ID" "$WL_APP"
           echo "Wanderlog installed"
 
-      - name: Write Wanderlog Maestro flow
+      - name: Launch Wanderlog + run Maestro flow
         run: |
-          cat > /tmp/maestro/wanderlog_flow.yaml << 'FLOWEOF'
-          appId: com.wanderlog.ios
-          ---
-          - launchApp:
-              appId: com.wanderlog.ios
-              clearState: false
-          - waitForAnimationToEnd:
-              timeout: 15000
-          - takeScreenshot: wanderlog_01_launch
+          SIM_ID="${{ env.SIM_ID }}"
+          BUNDLE_ID="com.wanderlog.ios"
+          OUT="/tmp/artifacts/wanderlog-screenshots"
+          mkdir -p "$OUT"
 
-          # Permission dialogs
-          - runFlow:
-              when:
-                visible: "Allow"
-              commands:
-                - tapOn: "Allow"
-                - waitForAnimationToEnd
+          echo "Launching Wanderlog..."
+          xcrun simctl launch "$SIM_ID" "$BUNDLE_ID" 2>&1 || true
+          # RN/Hermes app needs longer to load JS bundle
+          sleep 22
 
-          # RN bundle takes a moment — wait for any text to appear
-          - waitForAnimationToEnd: {timeout: 8000}
-          - takeScreenshot: wanderlog_02_loaded
+          xcrun simctl io "$SIM_ID" screenshot "$OUT/00_launch_raw.png" 2>/dev/null || true
 
-          # Get Started
-          - runFlow:
-              when:
-                visible: "Get started"
-              commands:
-                - takeScreenshot: wanderlog_03_getstarted
-                - tapOn: "Get started"
-                - waitForAnimationToEnd: {timeout: 5000}
-                - takeScreenshot: wanderlog_04_after_getstarted
+          python3 << 'PYEOF'
+flow = """appId: com.wanderlog.ios
+---
+- waitForAnimationToEnd:
+    timeout: 8000
+- takeScreenshot: wanderlog_01_loaded
 
-          - runFlow:
-              when:
-                visible: "Get Started"
-              commands:
-                - tapOn: "Get Started"
-                - waitForAnimationToEnd: {timeout: 5000}
-                - takeScreenshot: wanderlog_04b_after_getstarted
+- runFlow:
+    when:
+      visible: "Allow"
+    commands:
+      - tapOn: "Allow"
+      - waitForAnimationToEnd
 
-          # Onboarding carousel
-          - repeat:
-              times: 8
-              commands:
-                - runFlow:
-                    when:
-                      visible: "Next"
-                    commands:
-                      - tapOn: "Next"
-                      - waitForAnimationToEnd: {timeout: 3000}
-                      - takeScreenshot: wanderlog_slide_next
-                - runFlow:
-                    when:
-                      visible: "Continue"
-                    commands:
-                      - tapOn: "Continue"
-                      - waitForAnimationToEnd: {timeout: 3000}
-                      - takeScreenshot: wanderlog_slide_continue
-                - runFlow:
-                    when:
-                      visible: "NEXT"
-                    commands:
-                      - tapOn: "NEXT"
-                      - waitForAnimationToEnd: {timeout: 3000}
-                      - takeScreenshot: wanderlog_slide_NEXT
+- takeScreenshot: wanderlog_02_permissions_done
 
-          # Skip sign-up / sign-in prompts
-          - runFlow:
-              when:
-                visible: "Skip"
-              commands:
-                - takeScreenshot: wanderlog_skip_visible
-                - tapOn: "Skip"
-                - waitForAnimationToEnd
+- runFlow:
+    when:
+      visible: "Get started"
+    commands:
+      - tapOn: "Get started"
+      - waitForAnimationToEnd:
+          timeout: 5000
+      - takeScreenshot: wanderlog_03_after_getstarted
 
-          - runFlow:
-              when:
-                visible: "Maybe later"
-              commands:
-                - tapOn: "Maybe later"
-                - waitForAnimationToEnd
+- runFlow:
+    when:
+      visible: "Get Started"
+    commands:
+      - tapOn: "Get Started"
+      - waitForAnimationToEnd:
+          timeout: 5000
+      - takeScreenshot: wanderlog_03b_after_getstarted
 
-          - runFlow:
-              when:
-                visible: "Not now"
-              commands:
-                - tapOn: "Not now"
-                - waitForAnimationToEnd
+- repeat:
+    times: 8
+    commands:
+      - runFlow:
+          when:
+            visible: "Next"
+          commands:
+            - tapOn: "Next"
+            - waitForAnimationToEnd:
+                timeout: 3000
+            - takeScreenshot: wanderlog_slide_next
+      - runFlow:
+          when:
+            visible: "Continue"
+          commands:
+            - tapOn: "Continue"
+            - waitForAnimationToEnd:
+                timeout: 3000
+            - takeScreenshot: wanderlog_slide_continue
+      - runFlow:
+          when:
+            visible: "NEXT"
+          commands:
+            - tapOn: "NEXT"
+            - waitForAnimationToEnd:
+                timeout: 3000
+            - takeScreenshot: wanderlog_slide_NEXT
 
-          - takeScreenshot: wanderlog_05_post_onboarding
+- runFlow:
+    when:
+      visible: "Skip"
+    commands:
+      - tapOn: "Skip"
+      - waitForAnimationToEnd
+      - takeScreenshot: wanderlog_skip
 
-          # Explore main navigation
-          - runFlow:
-              when:
-                visible: "Trips"
-              commands:
-                - tapOn: "Trips"
-                - waitForAnimationToEnd: {timeout: 3000}
-                - takeScreenshot: wanderlog_06_trips
+- runFlow:
+    when:
+      visible: "Maybe later"
+    commands:
+      - tapOn: "Maybe later"
+      - waitForAnimationToEnd
 
-          - runFlow:
-              when:
-                visible: "Explore"
-              commands:
-                - tapOn: "Explore"
-                - waitForAnimationToEnd: {timeout: 3000}
-                - takeScreenshot: wanderlog_07_explore
+- runFlow:
+    when:
+      visible: "Not now"
+    commands:
+      - tapOn: "Not now"
+      - waitForAnimationToEnd
 
-          - runFlow:
-              when:
-                visible: "Profile"
-              commands:
-                - tapOn: "Profile"
-                - waitForAnimationToEnd: {timeout: 3000}
-                - takeScreenshot: wanderlog_08_profile
+- takeScreenshot: wanderlog_04_post_onboarding
 
-          - runFlow:
-              when:
-                visible: "Budget"
-              commands:
-                - tapOn: "Budget"
-                - waitForAnimationToEnd: {timeout: 3000}
-                - takeScreenshot: wanderlog_09_budget
+- runFlow:
+    when:
+      visible: "Trips"
+    commands:
+      - tapOn: "Trips"
+      - waitForAnimationToEnd:
+          timeout: 3000
+      - takeScreenshot: wanderlog_05_trips
 
-          - takeScreenshot: wanderlog_10_final
-          FLOWEOF
+- runFlow:
+    when:
+      visible: "Explore"
+    commands:
+      - tapOn: "Explore"
+      - waitForAnimationToEnd:
+          timeout: 3000
+      - takeScreenshot: wanderlog_06_explore
 
-      - name: Run Wanderlog Maestro flow
-        run: |
-          mkdir -p /tmp/artifacts/wanderlog-screenshots
-          maestro --device "${{ env.SIM_ID }}" test \
-            --output /tmp/artifacts/wanderlog-screenshots \
-            /tmp/maestro/wanderlog_flow.yaml \
-            2>&1 | tee /tmp/artifacts/wanderlog-screenshots/maestro_log.txt || true
-          echo "Screenshots: $(ls /tmp/artifacts/wanderlog-screenshots/*.png 2>/dev/null | wc -l)"
+- runFlow:
+    when:
+      visible: "Profile"
+    commands:
+      - tapOn: "Profile"
+      - waitForAnimationToEnd:
+          timeout: 3000
+      - takeScreenshot: wanderlog_07_profile
+
+- runFlow:
+    when:
+      visible: "Budget"
+    commands:
+      - tapOn: "Budget"
+      - waitForAnimationToEnd:
+          timeout: 3000
+      - takeScreenshot: wanderlog_08_budget
+
+- takeScreenshot: wanderlog_09_final
+"""
+with open("/tmp/maestro/wanderlog_flow.yaml", "w") as f:
+    f.write(flow)
+print("Wanderlog flow written")
+PYEOF
+
+          maestro --device "$SIM_ID" test /tmp/maestro/wanderlog_flow.yaml \
+            2>&1 | tee "$OUT/maestro_log.txt" || true
+
+          MAESTRO_OUT=$(ls -td ~/.maestro/tests/*/ 2>/dev/null | head -1)
+          if [ -n "$MAESTRO_OUT" ]; then
+            find "$MAESTRO_OUT" -name "*.png" -exec cp {} "$OUT/" \; 2>/dev/null || true
+          fi
+
+          echo "Total screenshots: $(ls $OUT/*.png 2>/dev/null | wc -l)"
 
       - name: Dump Wanderlog container
         run: |
