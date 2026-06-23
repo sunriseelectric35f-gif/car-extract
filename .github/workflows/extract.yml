@@ -26,25 +26,65 @@ jobs:
           echo "Compile exit: $?"
           ls -lh /tmp/extract_car
 
-      - name: Extract Tripsy
+      - name: Extract Tripsy (main app)
         run: |
           mkdir -p output/tripsy
           /tmp/extract_car Tripsy.car output/tripsy/ 2>&1
           echo "Files: $(ls output/tripsy/ | wc -l)"
-          ls output/tripsy/ | head -30
+
+      - name: Extract Tripsy Widgets
+        run: |
+          mkdir -p output/tripsy-widgets
+          /tmp/extract_car TripsyWidgets.car output/tripsy-widgets/ 2>&1
+          echo "Files: $(ls output/tripsy-widgets/ | wc -l)"
+
+      - name: Extract Tripsy Share Extension
+        run: |
+          mkdir -p output/tripsy-share
+          /tmp/extract_car TripsyShareExt.car output/tripsy-share/ 2>&1
+          echo "Files: $(ls output/tripsy-share/ | wc -l)"
+
+      - name: Extract Tripsy Intent Extension
+        run: |
+          mkdir -p output/tripsy-intent
+          /tmp/extract_car TripsyIntentExt.car output/tripsy-intent/ 2>&1
+          echo "Files: $(ls output/tripsy-intent/ | wc -l)"
 
       - name: Extract Wanderlog
         run: |
           mkdir -p output/wanderlog
           /tmp/extract_car Wanderlog.car output/wanderlog/ 2>&1
           echo "Files: $(ls output/wanderlog/ | wc -l)"
-          ls output/wanderlog/ | head -30
 
       - name: Upload Tripsy assets
         uses: actions/upload-artifact@v4
         with:
           name: tripsy-assets
           path: output/tripsy/
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Upload Tripsy Widgets assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: tripsy-widgets-assets
+          path: output/tripsy-widgets/
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Upload Tripsy Share Extension assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: tripsy-share-assets
+          path: output/tripsy-share/
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Upload Tripsy Intent Extension assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: tripsy-intent-assets
+          path: output/tripsy-intent/
           retention-days: 14
           if-no-files-found: warn
 
