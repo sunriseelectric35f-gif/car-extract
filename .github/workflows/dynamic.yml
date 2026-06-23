@@ -56,13 +56,27 @@ jobs:
 
       - name: Setup mitmproxy + system proxy
         run: |
-          pip3 install mitmproxy --quiet --break-system-packages 2>&1 | tail -3
+          pip3 install mitmproxy --quiet --break-system-packages 2>&1 | tail -3 || echo "pip fallback"
           mkdir -p /tmp/artifacts/network
 
-          # Generate mitmproxy CA cert
+          # Write cert-gen helper via base64 (heredoc would break YAML block scalar at col-0)
+          echo "ZnJvbSBtaXRtcHJveHkuY2VydHMgaW1wb3J0IENlcnRTdG9yZQpmcm9tIHBhdGhsaWIgaW1wb3J0IFBhdGgKc3RvcmVfcGF0aCA9IFBhdGguaG9tZSgpIC8gIi5taXRtcHJveHkiCnN0b3JlX3BhdGgubWtkaXIoZXhpc3Rfb2s9VHJ1ZSkKQ2VydFN0b3JlLmNyZWF0ZV9zdG9yZShzdG9yZV9wYXRoLCAibWl0bXByb3h5IiwgMjA0OCwgTm9uZSkKcHJpbnQoIkNBIHN0b3JlIGNyZWF0ZWQ6Iiwgc3RvcmVfcGF0aCkK" | base64 -d > /tmp/gen_mitm_cert.py
+
+          # Generate mitmproxy CA cert — poll up to 30s instead of fixed sleep
           mitmdump -p 8889 --set block_global=false -q &
-          MPID=$!; sleep 8; kill $MPID 2>/dev/null || true
-          echo "CA cert: $(ls -lh ~/.mitmproxy/mitmproxy-ca-cert.pem)"
+          MPID=$!
+          for i in $(seq 1 30); do
+            sleep 1
+            [ -f ~/.mitmproxy/mitmproxy-ca-cert.pem ] && echo "CA cert ready in ${i}s" && break
+          done
+          kill $MPID 2>/dev/null || true
+
+          if [ ! -f ~/.mitmproxy/mitmproxy-ca-cert.pem ]; then
+            echo "mitmdump cert generation failed — trying python fallback"
+            python3 /tmp/gen_mitm_cert.py && ls -lh ~/.mitmproxy/ || true
+          fi
+
+          echo "CA cert: $(ls -lh ~/.mitmproxy/mitmproxy-ca-cert.pem 2>/dev/null || echo MISSING)"
 
           # Trust in simulator keychain BEFORE any app launch
           xcrun simctl keychain "${{ env.SIM_ID }}" add-root-cert ~/.mitmproxy/mitmproxy-ca-cert.pem
