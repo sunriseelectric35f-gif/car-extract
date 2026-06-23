@@ -123,9 +123,9 @@ jobs:
           static OSStatus my_SecTrustGetTrustResult(SecTrustRef t, SecTrustResultType *r) {
               if (r) *r = kSecTrustResultProceed; return 0;
           }
-          DYLD_INTERPOSE(my_SecTrustEvaluateWithError, SecTrustEvaluateWithError)
-          DYLD_INTERPOSE(my_SecTrustEvaluate, SecTrustEvaluate)
-          DYLD_INTERPOSE(my_SecTrustGetTrustResult, SecTrustGetTrustResult)
+          DYLD_INTERPOSE(my_SecTrustEvaluateWithError, SecTrustEvaluateWithError);
+          DYLD_INTERPOSE(my_SecTrustEvaluate, SecTrustEvaluate);
+          DYLD_INTERPOSE(my_SecTrustGetTrustResult, SecTrustGetTrustResult);
 
           // ── ObjC-level challenge bypass ────────────────────────────────────
           // Hooks ALL classes implementing URLSession challenge delegates.
