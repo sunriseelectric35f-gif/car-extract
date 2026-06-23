@@ -90,36 +90,52 @@ jobs:
         run: |
           SIM_ID="${{ env.SIM_ID }}"
           APP_PATH="${{ env.APP_PATH }}"
+          APP_NAME=$(basename "$APP_PATH" .app)
 
           # Remove device-only extensions that can't run in sim
           rm -rf "$APP_PATH/PlugIns" "$APP_PATH/Extensions" "$APP_PATH/Watch" 2>/dev/null || true
 
+          # Remove Setapp framework (checks entitlements at launch, rejects simulator)
+          rm -rf "$APP_PATH/Frameworks/Setapp.framework" 2>/dev/null || true
+
+          # Minimal simulator entitlements — strip all team/app IDs, just allow task
+          cat > /tmp/sim_ents.plist << 'ENTSEOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>get-task-allow</key>
+              <true/>
+              <key>com.apple.security.get-task-allow</key>
+              <true/>
+          </dict>
+          </plist>
+          ENTSEOF
+
           # vtool: patch every Mach-O binary from ios -> iossimulator platform
           patch_macho() {
             local f="$1"
-            if file "$f" 2>/dev/null | grep -qE "Mach-O (64-bit )?executable|Mach-O (64-bit )?dynamically"; then
+            if file "$f" 2>/dev/null | grep -qE "Mach-O (64-bit )?executable|Mach-O (64-bit )?dynamically linked"; then
               vtool -set-build-version iossimulator 16.0 16.0 -replace -output "${f}.sim" "$f" 2>/dev/null \
-                && mv "${f}.sim" "$f" \
-                || echo "vtool skip: $f"
+                && mv "${f}.sim" "$f" && echo "vtool ok: $(basename $f)" \
+                || echo "vtool skip: $(basename $f)"
             fi
           }
 
-          # Main binary (detect name = app name without .app)
-          APP_NAME=$(basename "$APP_PATH" .app)
           patch_macho "$APP_PATH/$APP_NAME"
-
-          # All frameworks and dylibs
           find "$APP_PATH/Frameworks" -type f 2>/dev/null | while read f; do patch_macho "$f"; done
 
-          # Strip all old signatures
+          # Strip all existing signatures
           find "$APP_PATH/Frameworks" -maxdepth 2 -type f -exec codesign --remove-signature {} \; 2>/dev/null || true
           codesign --remove-signature "$APP_PATH/$APP_NAME" 2>/dev/null || true
           codesign --remove-signature "$APP_PATH" 2>/dev/null || true
 
-          # Ad-hoc re-sign: frameworks first, then app
-          find "$APP_PATH/Frameworks" -maxdepth 1 \( -name "*.framework" -o -name "*.dylib" \) \
-            -exec codesign -f -s - {} \; 2>/dev/null || true
-          codesign -f -s - "$APP_PATH"
+          # Re-sign: frameworks first (no entitlements needed), then main bundle with minimal ents
+          find "$APP_PATH/Frameworks" -maxdepth 1 \( -name "*.framework" -o -name "*.dylib" \) | while read fw; do
+            codesign -f -s - "$fw" 2>/dev/null && echo "signed: $(basename $fw)" || echo "sign-fail: $(basename $fw)"
+          done
+          codesign -f -s - --entitlements /tmp/sim_ents.plist "$APP_PATH"
+          echo "Signing: $(codesign -dv --entitlements - "$APP_PATH" 2>&1 | head -5)"
 
           # Install into simulator
           xcrun simctl install "$SIM_ID" "$APP_PATH"
@@ -132,15 +148,10 @@ jobs:
           OUT="/tmp/artifacts/tripsy-screenshots"
           mkdir -p "$OUT"
 
-          # Launch
           echo "Launching Tripsy..."
-          xcrun simctl launch "$SIM_ID" "$BUNDLE_ID" 2>&1 || {
-            echo "Launch attempt 2 after reinstall..."
-            APP_PATH="${{ env.APP_PATH }}"
-            codesign -f -s - "$APP_PATH"
-            xcrun simctl install "$SIM_ID" "$APP_PATH"
-            xcrun simctl launch "$SIM_ID" "$BUNDLE_ID" 2>&1
-          }
+          xcrun simctl launch "$SIM_ID" "$BUNDLE_ID" 2>&1 || \
+            xcrun simctl launch "$SIM_ID" "$BUNDLE_ID" 2>&1 || \
+            echo "Tripsy launch failed — screenshots will be sim idle state"
 
           SS() { xcrun simctl io "$SIM_ID" screenshot "$OUT/$1.png" 2>/dev/null && echo "screenshot: $1" || true; }
           TAP() { xcrun simctl io "$SIM_ID" tap "$1" "$2" 2>/dev/null || true; }
@@ -228,35 +239,46 @@ jobs:
         run: |
           SIM_ID="${{ env.SIM_ID }}"
           WL_APP="${{ env.WL_APP }}"
+          APP_NAME=$(basename "$WL_APP" .app)
 
-          # Terminate Tripsy
           xcrun simctl terminate "$SIM_ID" "app.tripsy.ios" 2>/dev/null || true
           sleep 2
 
           rm -rf "$WL_APP/PlugIns" "$WL_APP/Extensions" 2>/dev/null || true
 
+          cat > /tmp/sim_ents_wl.plist << 'ENTSEOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>get-task-allow</key>
+              <true/>
+              <key>com.apple.security.get-task-allow</key>
+              <true/>
+          </dict>
+          </plist>
+          ENTSEOF
+
           patch_macho() {
             local f="$1"
-            if file "$f" 2>/dev/null | grep -qE "Mach-O (64-bit )?executable|Mach-O (64-bit )?dynamically"; then
+            if file "$f" 2>/dev/null | grep -qE "Mach-O (64-bit )?executable|Mach-O (64-bit )?dynamically linked"; then
               vtool -set-build-version iossimulator 16.0 16.0 -replace -output "${f}.sim" "$f" 2>/dev/null \
-                && mv "${f}.sim" "$f" \
-                || echo "vtool skip: $f"
+                && mv "${f}.sim" "$f" && echo "vtool ok: $(basename $f)" \
+                || echo "vtool skip: $(basename $f)"
             fi
           }
 
-          # Wanderlog main binary name
-          APP_NAME=$(basename "$WL_APP" .app)
           patch_macho "$WL_APP/$APP_NAME"
-
           find "$WL_APP/Frameworks" -type f 2>/dev/null | while read f; do patch_macho "$f"; done
 
           find "$WL_APP/Frameworks" -maxdepth 2 -type f -exec codesign --remove-signature {} \; 2>/dev/null || true
           codesign --remove-signature "$WL_APP/$APP_NAME" 2>/dev/null || true
           codesign --remove-signature "$WL_APP" 2>/dev/null || true
 
-          find "$WL_APP/Frameworks" -maxdepth 1 \( -name "*.framework" -o -name "*.dylib" \) \
-            -exec codesign -f -s - {} \; 2>/dev/null || true
-          codesign -f -s - "$WL_APP"
+          find "$WL_APP/Frameworks" -maxdepth 1 \( -name "*.framework" -o -name "*.dylib" \) | while read fw; do
+            codesign -f -s - "$fw" 2>/dev/null && echo "signed: $(basename $fw)" || echo "sign-fail: $(basename $fw)"
+          done
+          codesign -f -s - --entitlements /tmp/sim_ents_wl.plist "$WL_APP"
 
           xcrun simctl install "$SIM_ID" "$WL_APP"
           echo "Wanderlog installed"
@@ -269,13 +291,9 @@ jobs:
           mkdir -p "$OUT"
 
           echo "Launching Wanderlog..."
-          xcrun simctl launch "$SIM_ID" "$BUNDLE_ID" 2>&1 || {
-            echo "Launch attempt 2..."
-            WL_APP="${{ env.WL_APP }}"
-            codesign -f -s - "$WL_APP"
-            xcrun simctl install "$SIM_ID" "$WL_APP"
-            xcrun simctl launch "$SIM_ID" "$BUNDLE_ID" 2>&1
-          }
+          xcrun simctl launch "$SIM_ID" "$BUNDLE_ID" 2>&1 || \
+            xcrun simctl launch "$SIM_ID" "$BUNDLE_ID" 2>&1 || \
+            echo "Wanderlog launch failed — screenshots will be sim idle state"
 
           SS() { xcrun simctl io "$SIM_ID" screenshot "$OUT/$1.png" 2>/dev/null && echo "screenshot: $1" || true; }
           TAP() { xcrun simctl io "$SIM_ID" tap "$1" "$2" 2>/dev/null || true; }
