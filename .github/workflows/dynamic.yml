@@ -59,50 +59,34 @@ jobs:
           APP_PATH="${{ env.APP_PATH }}"
           mkdir -p /tmp/artifacts/tripsy-colors
 
-          # Method 1: assetutil --info on Assets.car (works on macOS)
-          echo "=== assetutil info ===" > /tmp/artifacts/tripsy-colors/colors_raw.txt
-          xcrun assetutil --info "$APP_PATH/Assets.car" >> /tmp/artifacts/tripsy-colors/colors_raw.txt 2>&1 || true
+          # Dump full assetutil catalog first
+          xcrun assetutil --info "$APP_PATH/Assets.car" > /tmp/artifacts/tripsy-colors/full_catalog.json 2>&1 || true
+          echo "Full catalog size: $(wc -c < /tmp/artifacts/tripsy-colors/full_catalog.json) bytes"
 
-          # Extract just color entries
+          # Parse colors from full_catalog.json
           python3 << 'PYEOF'
           import json, sys
-
-          with open("/tmp/artifacts/tripsy-colors/colors_raw.txt") as f:
+          with open("/tmp/artifacts/tripsy-colors/full_catalog.json") as f:
               content = f.read()
-
-          # assetutil outputs JSON array
           try:
-              data = json.loads(content.split("=== assetutil info ===\n", 1)[-1])
+              data = json.loads(content)
           except Exception as e:
               print(f"Parse error: {e}")
               sys.exit(0)
-
           colors = [x for x in data if x.get("AssetType") == "Color"]
           print(f"Found {len(colors)} color entries")
-
           color_report = {}
           for c in colors:
               name = c.get("Name", "unknown")
-              # Extract RGB values
               comps = c.get("Color", {}).get("components", {})
               space = c.get("Color", {}).get("colorspace", "srgb")
               appearance = c.get("Appearances", [{}])[0].get("Appearance", "Any")
-              
-              entry = {
-                  "space": space,
-                  "components": comps,
-                  "appearance": appearance,
-                  "raw": c
-              }
+              entry = {"space": space, "components": comps, "appearance": appearance, "raw": c}
               if name not in color_report:
                   color_report[name] = []
               color_report[name].append(entry)
-
-          # Write clean JSON
           with open("/tmp/artifacts/tripsy-colors/colors.json", "w") as f:
               json.dump(color_report, f, indent=2)
-
-          # Write markdown report
           with open("/tmp/artifacts/tripsy-colors/colors.md", "w") as f:
               f.write("# Tripsy Color Palette\n\n")
               f.write(f"Total named colors: {len(color_report)}\n\n")
@@ -110,28 +94,14 @@ jobs:
                   f.write(f"## {name}\n")
                   for v in variants:
                       comps = v.get("components", {})
-                      f.write(f"- **{v.get('appearance', 'Any')}** ({v.get('space', 'srgb')}): ")
                       r = comps.get("red", comps.get("r", "?"))
                       g = comps.get("green", comps.get("g", "?"))
                       b = comps.get("blue", comps.get("b", "?"))
                       a = comps.get("alpha", comps.get("a", 1.0))
-                      f.write(f"R={r} G={g} B={b} A={a}\n")
+                      f.write(f"- **{v.get('appearance', 'Any')}** ({v.get('space', 'srgb')}): R={r} G={g} B={b} A={a}\n")
                   f.write("\n")
-
           print("Done writing colors.json and colors.md")
           PYEOF
-
-          # Also dump full assetutil catalog (all asset types)
-          xcrun assetutil --info "$APP_PATH/Assets.car" > /tmp/artifacts/tripsy-colors/full_catalog.json 2>&1 || true
-          echo "Full catalog size: $(wc -c < /tmp/artifacts/tripsy-colors/full_catalog.json) bytes"
-
-          # Get all extension cars too
-          for ext_path in "$APP_PATH/PlugIns/"*.appex 2>/dev/null; do
-            if [ -d "$ext_path" ]; then
-              name=$(basename "$ext_path" .appex | tr ' ' '_')
-              xcrun assetutil --info "$ext_path/Assets.car" > "/tmp/artifacts/tripsy-colors/${name}_catalog.json" 2>&1 || true
-            fi
-          done || true
 
       - name: Extract color assets from Wanderlog
         run: |
