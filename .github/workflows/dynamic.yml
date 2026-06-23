@@ -17,25 +17,34 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Select simulator
+      - name: Install Maestro
         run: |
-          xcrun simctl list devices available | grep iPhone | head -20
+          export MAESTRO_VERSION=1.39.0
+          curl -Ls "https://get.maestro.mobile.dev" | bash
+          export PATH="$HOME/.maestro/bin:$PATH"
+          echo "$HOME/.maestro/bin" >> $GITHUB_PATH
+          maestro --version
+
+      - name: Select + boot simulator
+        run: |
+          xcrun simctl list devices available | grep iPhone | head -10
           SIM_ID=$(xcrun simctl list devices available -j | python3 -c "
           import sys, json
           data = json.load(sys.stdin)
           for runtime, devices in data['devices'].items():
               if 'iOS-18' in runtime or 'iOS-17' in runtime:
                   for d in devices:
+                      if d['isAvailable'] and 'iPhone 16' in d['name']:
+                          print(d['udid']); raise SystemExit(0)
+          # fallback: any iPhone
+          for runtime, devices in data['devices'].items():
+              if 'iOS-18' in runtime or 'iOS-17' in runtime:
+                  for d in devices:
                       if d['isAvailable'] and 'iPhone' in d['name']:
-                          print(d['udid'])
-                          raise SystemExit(0)
+                          print(d['udid']); raise SystemExit(0)
           ")
           echo "SIM_ID=$SIM_ID" >> $GITHUB_ENV
-          echo "Selected sim: $SIM_ID"
-
-      - name: Boot simulator
-        run: |
-          SIM_ID="${{ env.SIM_ID }}"
+          echo "Selected: $SIM_ID"
           open -a Simulator
           sleep 5
           xcrun simctl boot "$SIM_ID" 2>/dev/null || true
@@ -44,14 +53,47 @@ jobs:
 
       # ─── TRIPSY ────────────────────────────────────────────────────────────
 
-      - name: Extract Tripsy IPA
+      - name: Extract + patch Tripsy IPA
         run: |
           cd /tmp/ipas
           unzip -q Tripsy.ipa -d tripsy_app
           APP_PATH=$(find /tmp/ipas/tripsy_app/Payload -name "*.app" -maxdepth 1 -type d)
           echo "APP_PATH=$APP_PATH" >> $GITHUB_ENV
-          echo "Tripsy app: $APP_PATH"
-          ls "$APP_PATH" | head -20
+          APP_NAME=$(basename "$APP_PATH" .app)
+
+          rm -rf "$APP_PATH/PlugIns" "$APP_PATH/Extensions" "$APP_PATH/Watch" 2>/dev/null || true
+          rm -rf "$APP_PATH/Frameworks/Setapp.framework" 2>/dev/null || true
+
+          cat > /tmp/sim_ents.plist << 'ENTSEOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+              <key>get-task-allow</key><true/>
+              <key>com.apple.security.get-task-allow</key><true/>
+          </dict></plist>
+          ENTSEOF
+
+          patch_macho() {
+            local f="$1"
+            if file "$f" 2>/dev/null | grep -qE "Mach-O (64-bit )?executable|Mach-O (64-bit )?dynamically linked"; then
+              vtool -set-build-version iossimulator 16.0 16.0 -replace -output "${f}.sim" "$f" 2>/dev/null \
+                && mv "${f}.sim" "$f" && echo "vtool ok: $(basename $f)" \
+                || echo "vtool skip: $(basename $f)"
+            fi
+          }
+          patch_macho "$APP_PATH/$APP_NAME"
+          find "$APP_PATH/Frameworks" -type f 2>/dev/null | while read f; do patch_macho "$f"; done
+
+          find "$APP_PATH/Frameworks" -maxdepth 2 -type f -exec codesign --remove-signature {} \; 2>/dev/null || true
+          codesign --remove-signature "$APP_PATH/$APP_NAME" 2>/dev/null || true
+          codesign --remove-signature "$APP_PATH" 2>/dev/null || true
+          find "$APP_PATH/Frameworks" -maxdepth 1 \( -name "*.framework" -o -name "*.dylib" \) | while read fw; do
+            codesign -f -s - "$fw" 2>/dev/null && echo "signed: $(basename $fw)" || echo "sign-fail: $(basename $fw)"
+          done
+          codesign -f -s - --entitlements /tmp/sim_ents.plist "$APP_PATH"
+
+          xcrun simctl install "${{ env.SIM_ID }}" "$APP_PATH"
+          echo "Tripsy installed"
 
       - name: Extract Tripsy color assets
         run: |
@@ -64,189 +106,182 @@ jobs:
           idx = raw.find('[')
           data = json.loads(raw[idx:]) if idx >= 0 else []
           colors = [x for x in data if x.get("AssetType") == "Color"]
-          def to_hex(comps):
-              if isinstance(comps, list) and len(comps) >= 3:
-                  return "#{:02X}{:02X}{:02X}".format(int(comps[0]*255),int(comps[1]*255),int(comps[2]*255))
-              return None
-          report = {}
+          out = []
           for c in colors:
-              name = c.get("Name", "unknown")
-              comps = c.get("Color components", [])
-              appearance = c.get("Appearance", "Any")
-              if name not in report:
-                  report[name] = {}
-              report[name][appearance] = {"hex": to_hex(comps), "components": comps}
-          with open("/tmp/artifacts/tripsy-colors/colors.json", "w") as f:
-              json.dump(report, f, indent=2)
-          with open("/tmp/artifacts/tripsy-colors/colors.md", "w") as f:
-              f.write(f"# Tripsy Color Palette ({len(report)} named colors)\n\n")
-              for name in sorted(report.keys()):
-                  parts = [f"{app}: {v['hex']}" for app, v in sorted(report[name].items())]
-                  f.write(f"- **{name}**: {' | '.join(parts)}\n")
-          print(f"Tripsy colors: {len(report)} named, {len(colors)} entries total")
+            comps = c.get("Color components", {})
+            def tohex(comps):
+              try:
+                r = round(float(comps.get("red",0))*255)
+                g = round(float(comps.get("green",0))*255)
+                b = round(float(comps.get("blue",0))*255)
+                return f"#{r:02X}{g:02X}{b:02X}"
+              except: return None
+            name = c.get("Name","?")
+            hex_val = tohex(comps) if comps else None
+            out.append({"name": name, "hex": hex_val, "appearances": c.get("Appearances",[])})
+          with open("/tmp/artifacts/tripsy-colors/colors.json","w") as f:
+            json.dump(out, f, indent=2)
+          print(f"Extracted {len(out)} Tripsy colors")
           PYEOF
 
-      - name: Patch Tripsy binary for simulator (vtool + resign)
+      - name: Write Tripsy Maestro flow
+        run: |
+          mkdir -p /tmp/maestro
+          cat > /tmp/maestro/tripsy_flow.yaml << 'FLOWEOF'
+          appId: app.tripsy.ios
+          ---
+          - launchApp:
+              appId: app.tripsy.ios
+              clearState: false
+          - waitForAnimationToEnd:
+              timeout: 12000
+          - takeScreenshot: tripsy_01_launch
+
+          # Dismiss any permission dialogs
+          - runFlow:
+              when:
+                visible: "Allow"
+              commands:
+                - tapOn: "Allow"
+                - waitForAnimationToEnd
+          - runFlow:
+              when:
+                visible: "Continue"
+              commands:
+                - takeScreenshot: tripsy_02_pre_continue
+                - tapOn: "Continue"
+                - waitForAnimationToEnd: {timeout: 4000}
+          - takeScreenshot: tripsy_03_after_continue
+
+          # Get Started / onboarding entry
+          - runFlow:
+              when:
+                visible: "Get Started"
+              commands:
+                - takeScreenshot: tripsy_04_getstarted_visible
+                - tapOn: "Get Started"
+                - waitForAnimationToEnd: {timeout: 5000}
+                - takeScreenshot: tripsy_05_after_getstarted
+
+          # Onboarding slides — tap Next/Continue up to 6 times
+          - repeat:
+              times: 6
+              commands:
+                - runFlow:
+                    when:
+                      visible: "Next"
+                    commands:
+                      - tapOn: "Next"
+                      - waitForAnimationToEnd: {timeout: 3000}
+                      - takeScreenshot: tripsy_slide_next
+                - runFlow:
+                    when:
+                      visible: "Continue"
+                    commands:
+                      - tapOn: "Continue"
+                      - waitForAnimationToEnd: {timeout: 3000}
+                      - takeScreenshot: tripsy_slide_continue
+
+          # Skip sign-in if visible
+          - runFlow:
+              when:
+                visible: "Skip"
+              commands:
+                - takeScreenshot: tripsy_skip_visible
+                - tapOn: "Skip"
+                - waitForAnimationToEnd: {timeout: 3000}
+
+          - runFlow:
+              when:
+                visible: "Maybe Later"
+              commands:
+                - tapOn: "Maybe Later"
+                - waitForAnimationToEnd
+
+          - takeScreenshot: tripsy_06_post_onboarding
+
+          # Explore main tabs — tap each tab bar item
+          - runFlow:
+              when:
+                visible: "Trips"
+              commands:
+                - tapOn: "Trips"
+                - waitForAnimationToEnd: {timeout: 3000}
+                - takeScreenshot: tripsy_07_trips_tab
+
+          - runFlow:
+              when:
+                visible: "Explore"
+              commands:
+                - tapOn: "Explore"
+                - waitForAnimationToEnd: {timeout: 3000}
+                - takeScreenshot: tripsy_08_explore_tab
+
+          - runFlow:
+              when:
+                visible: "Today"
+              commands:
+                - tapOn: "Today"
+                - waitForAnimationToEnd: {timeout: 3000}
+                - takeScreenshot: tripsy_09_today_tab
+
+          - runFlow:
+              when:
+                visible: "Settings"
+              commands:
+                - tapOn: "Settings"
+                - waitForAnimationToEnd: {timeout: 3000}
+                - takeScreenshot: tripsy_10_settings_tab
+
+          # Try to create a trip
+          - runFlow:
+              when:
+                visible: "New Trip"
+              commands:
+                - tapOn: "New Trip"
+                - waitForAnimationToEnd: {timeout: 3000}
+                - takeScreenshot: tripsy_11_new_trip
+                - tapOn: "Cancel"
+
+          - takeScreenshot: tripsy_12_final
+          FLOWEOF
+
+      - name: Run Tripsy Maestro flow
+        run: |
+          mkdir -p /tmp/artifacts/tripsy-screenshots
+          maestro --device "${{ env.SIM_ID }}" test \
+            --output /tmp/artifacts/tripsy-screenshots \
+            /tmp/maestro/tripsy_flow.yaml \
+            2>&1 | tee /tmp/artifacts/tripsy-screenshots/maestro_log.txt || true
+          echo "Screenshots: $(ls /tmp/artifacts/tripsy-screenshots/*.png 2>/dev/null | wc -l)"
+
+      - name: Dump Tripsy container
         run: |
           SIM_ID="${{ env.SIM_ID }}"
-          APP_PATH="${{ env.APP_PATH }}"
-          APP_NAME=$(basename "$APP_PATH" .app)
-
-          # Remove device-only extensions that can't run in sim
-          rm -rf "$APP_PATH/PlugIns" "$APP_PATH/Extensions" "$APP_PATH/Watch" 2>/dev/null || true
-
-          # Remove Setapp framework (checks entitlements at launch, rejects simulator)
-          rm -rf "$APP_PATH/Frameworks/Setapp.framework" 2>/dev/null || true
-
-          # Minimal simulator entitlements — strip all team/app IDs, just allow task
-          cat > /tmp/sim_ents.plist << 'ENTSEOF'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-              <key>get-task-allow</key>
-              <true/>
-              <key>com.apple.security.get-task-allow</key>
-              <true/>
-          </dict>
-          </plist>
-          ENTSEOF
-
-          # vtool: patch every Mach-O binary from ios -> iossimulator platform
-          patch_macho() {
-            local f="$1"
-            if file "$f" 2>/dev/null | grep -qE "Mach-O (64-bit )?executable|Mach-O (64-bit )?dynamically linked"; then
-              vtool -set-build-version iossimulator 16.0 16.0 -replace -output "${f}.sim" "$f" 2>/dev/null \
-                && mv "${f}.sim" "$f" && echo "vtool ok: $(basename $f)" \
-                || echo "vtool skip: $(basename $f)"
-            fi
-          }
-
-          patch_macho "$APP_PATH/$APP_NAME"
-          find "$APP_PATH/Frameworks" -type f 2>/dev/null | while read f; do patch_macho "$f"; done
-
-          # Strip all existing signatures
-          find "$APP_PATH/Frameworks" -maxdepth 2 -type f -exec codesign --remove-signature {} \; 2>/dev/null || true
-          codesign --remove-signature "$APP_PATH/$APP_NAME" 2>/dev/null || true
-          codesign --remove-signature "$APP_PATH" 2>/dev/null || true
-
-          # Re-sign: frameworks first (no entitlements needed), then main bundle with minimal ents
-          find "$APP_PATH/Frameworks" -maxdepth 1 \( -name "*.framework" -o -name "*.dylib" \) | while read fw; do
-            codesign -f -s - "$fw" 2>/dev/null && echo "signed: $(basename $fw)" || echo "sign-fail: $(basename $fw)"
-          done
-          codesign -f -s - --entitlements /tmp/sim_ents.plist "$APP_PATH"
-          echo "Signing: $(codesign -dv --entitlements - "$APP_PATH" 2>&1 | head -5)"
-
-          # Install into simulator
-          xcrun simctl install "$SIM_ID" "$APP_PATH"
-          echo "Tripsy installed into $SIM_ID"
-
-      - name: Launch Tripsy + capture screenshots
-        run: |
-          SIM_ID="${{ env.SIM_ID }}"
-          BUNDLE_ID="app.tripsy.ios"
-          OUT="/tmp/artifacts/tripsy-screenshots"
-          mkdir -p "$OUT"
-
-          echo "Launching Tripsy..."
-          xcrun simctl launch "$SIM_ID" "$BUNDLE_ID" 2>&1 || \
-            xcrun simctl launch "$SIM_ID" "$BUNDLE_ID" 2>&1 || \
-            echo "Tripsy launch failed — screenshots will be sim idle state"
-
-          SS() { xcrun simctl io "$SIM_ID" screenshot "$OUT/$1.png" 2>/dev/null && echo "screenshot: $1" || true; }
-          TAP() { xcrun simctl io "$SIM_ID" tap "$1" "$2" 2>/dev/null || true; }
-          SWIPE() { xcrun simctl io "$SIM_ID" swipe "$1" "$2" "$3" "$4" 2>/dev/null || true; }
-
-          # Wait for app to fully load (heavy Swift app, first launch)
-          sleep 8;  SS "01_launch"
-          sleep 4;  SS "02_t4"
-          sleep 3;  SS "03_t7"
-
-          # Tripsy onboarding: "Get Started" button is bottom-center ~y=750
-          TAP 195 750; sleep 5; SS "04_tap_getstarted"
-
-          # "Continue" / "Next" on onboarding carousel — center bottom
-          TAP 195 720; sleep 4; SS "05_tap2"
-          TAP 195 720; sleep 4; SS "06_tap3"
-          TAP 195 720; sleep 4; SS "07_tap4"
-
-          # Skip / X button — top right corner
-          TAP 370 55;  sleep 3; SS "08_skip_topright"
-          # Also try top left back button
-          TAP 25 55;   sleep 3; SS "09_back_topleft"
-
-          # Swipe left (onboarding carousel)
-          SWIPE 350 400 50 400; sleep 3; SS "10_swipe_left"
-
-          # Swipe up (scroll content)
-          SWIPE 195 600 195 200; sleep 3; SS "11_scroll_up"
-
-          sleep 4; SS "12_final"
-
-          echo "Tripsy screenshots: $(ls $OUT/*.png 2>/dev/null | wc -l)"
-
-      - name: Dump Tripsy app container
-        run: |
-          SIM_ID="${{ env.SIM_ID }}"
-          BUNDLE_ID="app.tripsy.ios"
           OUT="/tmp/artifacts/tripsy-container"
           mkdir -p "$OUT"
-
-          CONTAINER=$(xcrun simctl get_app_container "$SIM_ID" "$BUNDLE_ID" data 2>/dev/null || echo "")
-          echo "Container: $CONTAINER"
-
+          CONTAINER=$(xcrun simctl get_app_container "$SIM_ID" "app.tripsy.ios" data 2>/dev/null || echo "")
           if [ -n "$CONTAINER" ]; then
-            # UserDefaults → JSON
             find "$CONTAINER/Library/Preferences" -name "*.plist" 2>/dev/null | while read f; do
               name=$(basename "$f")
               plutil -convert json "$f" -o "$OUT/${name}.json" 2>/dev/null || cp "$f" "$OUT/$name"
             done
-            # CoreData sqlite files
             find "$CONTAINER" -name "*.sqlite*" 2>/dev/null -exec cp {} "$OUT/" \;
-            # File tree
             find "$CONTAINER" -type f 2>/dev/null | sed "s|$CONTAINER/||" > "$OUT/file_tree.txt"
             echo "Container: $(wc -l < $OUT/file_tree.txt) files"
           else
-            echo "No container (app may not have launched successfully)"
+            echo "No container"
           fi
 
       # ─── WANDERLOG ─────────────────────────────────────────────────────────
 
-      - name: Extract Wanderlog IPA
+      - name: Extract + patch Wanderlog IPA
         run: |
           SIM_ID="${{ env.SIM_ID }}"
           cd /tmp/ipas
           unzip -q "Wanderlog_v2.208.ipa" -d wanderlog_app
           WL_APP=$(find /tmp/ipas/wanderlog_app/Payload -name "*.app" -maxdepth 1 -type d)
           echo "WL_APP=$WL_APP" >> $GITHUB_ENV
-          echo "Wanderlog app: $WL_APP"
-          ls "$WL_APP" | head -20
-
-      - name: Extract Wanderlog color assets
-        run: |
-          WL_APP="${{ env.WL_APP }}"
-          mkdir -p /tmp/artifacts/wanderlog-colors
-          if [ -f "$WL_APP/Assets.car" ]; then
-            xcrun assetutil --info "$WL_APP/Assets.car" \
-              > /tmp/artifacts/wanderlog-colors/full_catalog.json 2>&1 || true
-          else
-            echo "No Assets.car in Wanderlog (RN app — colors live in JS bundle)" \
-              > /tmp/artifacts/wanderlog-colors/note.txt
-            echo "[]" > /tmp/artifacts/wanderlog-colors/full_catalog.json
-          fi
-          python3 << 'PYEOF'
-          import json
-          raw = open("/tmp/artifacts/wanderlog-colors/full_catalog.json").read()
-          idx = raw.find('[')
-          data = json.loads(raw[idx:]) if idx >= 0 else []
-          colors = [x for x in data if x.get("AssetType") == "Color"]
-          print(f"Wanderlog .car colors: {len(colors)} (RN uses JS bundle for colors)")
-          PYEOF
-
-      - name: Patch Wanderlog binary for simulator (vtool + resign)
-        run: |
-          SIM_ID="${{ env.SIM_ID }}"
-          WL_APP="${{ env.WL_APP }}"
           APP_NAME=$(basename "$WL_APP" .app)
 
           xcrun simctl terminate "$SIM_ID" "app.tripsy.ios" 2>/dev/null || true
@@ -257,14 +292,10 @@ jobs:
           cat > /tmp/sim_ents_wl.plist << 'ENTSEOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-              <key>get-task-allow</key>
-              <true/>
-              <key>com.apple.security.get-task-allow</key>
-              <true/>
-          </dict>
-          </plist>
+          <plist version="1.0"><dict>
+              <key>get-task-allow</key><true/>
+              <key>com.apple.security.get-task-allow</key><true/>
+          </dict></plist>
           ENTSEOF
 
           patch_macho() {
@@ -275,74 +306,163 @@ jobs:
                 || echo "vtool skip: $(basename $f)"
             fi
           }
-
           patch_macho "$WL_APP/$APP_NAME"
           find "$WL_APP/Frameworks" -type f 2>/dev/null | while read f; do patch_macho "$f"; done
 
           find "$WL_APP/Frameworks" -maxdepth 2 -type f -exec codesign --remove-signature {} \; 2>/dev/null || true
           codesign --remove-signature "$WL_APP/$APP_NAME" 2>/dev/null || true
           codesign --remove-signature "$WL_APP" 2>/dev/null || true
-
           find "$WL_APP/Frameworks" -maxdepth 1 \( -name "*.framework" -o -name "*.dylib" \) | while read fw; do
             codesign -f -s - "$fw" 2>/dev/null && echo "signed: $(basename $fw)" || echo "sign-fail: $(basename $fw)"
           done
           codesign -f -s - --entitlements /tmp/sim_ents_wl.plist "$WL_APP"
-
           xcrun simctl install "$SIM_ID" "$WL_APP"
           echo "Wanderlog installed"
 
-      - name: Launch Wanderlog + capture screenshots
+      - name: Write Wanderlog Maestro flow
+        run: |
+          cat > /tmp/maestro/wanderlog_flow.yaml << 'FLOWEOF'
+          appId: com.wanderlog.ios
+          ---
+          - launchApp:
+              appId: com.wanderlog.ios
+              clearState: false
+          - waitForAnimationToEnd:
+              timeout: 15000
+          - takeScreenshot: wanderlog_01_launch
+
+          # Permission dialogs
+          - runFlow:
+              when:
+                visible: "Allow"
+              commands:
+                - tapOn: "Allow"
+                - waitForAnimationToEnd
+
+          # RN bundle takes a moment — wait for any text to appear
+          - waitForAnimationToEnd: {timeout: 8000}
+          - takeScreenshot: wanderlog_02_loaded
+
+          # Get Started
+          - runFlow:
+              when:
+                visible: "Get started"
+              commands:
+                - takeScreenshot: wanderlog_03_getstarted
+                - tapOn: "Get started"
+                - waitForAnimationToEnd: {timeout: 5000}
+                - takeScreenshot: wanderlog_04_after_getstarted
+
+          - runFlow:
+              when:
+                visible: "Get Started"
+              commands:
+                - tapOn: "Get Started"
+                - waitForAnimationToEnd: {timeout: 5000}
+                - takeScreenshot: wanderlog_04b_after_getstarted
+
+          # Onboarding carousel
+          - repeat:
+              times: 8
+              commands:
+                - runFlow:
+                    when:
+                      visible: "Next"
+                    commands:
+                      - tapOn: "Next"
+                      - waitForAnimationToEnd: {timeout: 3000}
+                      - takeScreenshot: wanderlog_slide_next
+                - runFlow:
+                    when:
+                      visible: "Continue"
+                    commands:
+                      - tapOn: "Continue"
+                      - waitForAnimationToEnd: {timeout: 3000}
+                      - takeScreenshot: wanderlog_slide_continue
+                - runFlow:
+                    when:
+                      visible: "NEXT"
+                    commands:
+                      - tapOn: "NEXT"
+                      - waitForAnimationToEnd: {timeout: 3000}
+                      - takeScreenshot: wanderlog_slide_NEXT
+
+          # Skip sign-up / sign-in prompts
+          - runFlow:
+              when:
+                visible: "Skip"
+              commands:
+                - takeScreenshot: wanderlog_skip_visible
+                - tapOn: "Skip"
+                - waitForAnimationToEnd
+
+          - runFlow:
+              when:
+                visible: "Maybe later"
+              commands:
+                - tapOn: "Maybe later"
+                - waitForAnimationToEnd
+
+          - runFlow:
+              when:
+                visible: "Not now"
+              commands:
+                - tapOn: "Not now"
+                - waitForAnimationToEnd
+
+          - takeScreenshot: wanderlog_05_post_onboarding
+
+          # Explore main navigation
+          - runFlow:
+              when:
+                visible: "Trips"
+              commands:
+                - tapOn: "Trips"
+                - waitForAnimationToEnd: {timeout: 3000}
+                - takeScreenshot: wanderlog_06_trips
+
+          - runFlow:
+              when:
+                visible: "Explore"
+              commands:
+                - tapOn: "Explore"
+                - waitForAnimationToEnd: {timeout: 3000}
+                - takeScreenshot: wanderlog_07_explore
+
+          - runFlow:
+              when:
+                visible: "Profile"
+              commands:
+                - tapOn: "Profile"
+                - waitForAnimationToEnd: {timeout: 3000}
+                - takeScreenshot: wanderlog_08_profile
+
+          - runFlow:
+              when:
+                visible: "Budget"
+              commands:
+                - tapOn: "Budget"
+                - waitForAnimationToEnd: {timeout: 3000}
+                - takeScreenshot: wanderlog_09_budget
+
+          - takeScreenshot: wanderlog_10_final
+          FLOWEOF
+
+      - name: Run Wanderlog Maestro flow
+        run: |
+          mkdir -p /tmp/artifacts/wanderlog-screenshots
+          maestro --device "${{ env.SIM_ID }}" test \
+            --output /tmp/artifacts/wanderlog-screenshots \
+            /tmp/maestro/wanderlog_flow.yaml \
+            2>&1 | tee /tmp/artifacts/wanderlog-screenshots/maestro_log.txt || true
+          echo "Screenshots: $(ls /tmp/artifacts/wanderlog-screenshots/*.png 2>/dev/null | wc -l)"
+
+      - name: Dump Wanderlog container
         run: |
           SIM_ID="${{ env.SIM_ID }}"
-          BUNDLE_ID="com.wanderlog.ios"
-          OUT="/tmp/artifacts/wanderlog-screenshots"
-          mkdir -p "$OUT"
-
-          echo "Launching Wanderlog..."
-          xcrun simctl launch "$SIM_ID" "$BUNDLE_ID" 2>&1 || \
-            xcrun simctl launch "$SIM_ID" "$BUNDLE_ID" 2>&1 || \
-            echo "Wanderlog launch failed — screenshots will be sim idle state"
-
-          SS() { xcrun simctl io "$SIM_ID" screenshot "$OUT/$1.png" 2>/dev/null && echo "screenshot: $1" || true; }
-          TAP() { xcrun simctl io "$SIM_ID" tap "$1" "$2" 2>/dev/null || true; }
-          SWIPE() { xcrun simctl io "$SIM_ID" swipe "$1" "$2" "$3" "$4" 2>/dev/null || true; }
-
-          # Wait for Wanderlog (RN/Hermes app, heavy JS bundle)
-          sleep 10; SS "01_launch"
-          sleep 4;  SS "02_t4"
-          sleep 3;  SS "03_t7"
-
-          # Wanderlog onboarding: "Get Started" / "Continue" bottom center
-          TAP 195 750; sleep 5; SS "04_tap_getstarted"
-          TAP 195 720; sleep 4; SS "05_tap2"
-          TAP 195 720; sleep 4; SS "06_tap3"
-          TAP 195 720; sleep 4; SS "07_tap4"
-
-          # Skip / X — top right
-          TAP 370 55;  sleep 3; SS "08_skip_topright"
-          # Back — top left
-          TAP 25 55;   sleep 3; SS "09_back_topleft"
-
-          # Swipe left (carousel)
-          SWIPE 350 400 50 400; sleep 3; SS "10_swipe_left"
-
-          # Swipe up (scroll)
-          SWIPE 195 600 195 200; sleep 3; SS "11_scroll_up"
-
-          sleep 4; SS "12_final"
-
-          echo "Wanderlog screenshots: $(ls $OUT/*.png 2>/dev/null | wc -l)"
-
-      - name: Dump Wanderlog app container
-        run: |
-          SIM_ID="${{ env.SIM_ID }}"
-          BUNDLE_ID="com.wanderlog.ios"
           OUT="/tmp/artifacts/wanderlog-container"
           mkdir -p "$OUT"
-
-          CONTAINER=$(xcrun simctl get_app_container "$SIM_ID" "$BUNDLE_ID" data 2>/dev/null || echo "")
-          echo "Container: $CONTAINER"
-
+          CONTAINER=$(xcrun simctl get_app_container "$SIM_ID" "com.wanderlog.ios" data 2>/dev/null || echo "")
           if [ -n "$CONTAINER" ]; then
             find "$CONTAINER/Library/Preferences" -name "*.plist" 2>/dev/null | while read f; do
               name=$(basename "$f")
@@ -352,33 +472,22 @@ jobs:
             find "$CONTAINER" -type f 2>/dev/null | sed "s|$CONTAINER/||" > "$OUT/file_tree.txt"
             echo "Wanderlog container: $(wc -l < $OUT/file_tree.txt) files"
           else
-            echo "No container found"
+            echo "No container"
           fi
 
       # ─── NETWORK CAPTURE ───────────────────────────────────────────────────
 
-      - name: Setup mitmproxy cert + simulator proxy
+      - name: Setup mitmproxy
         run: |
           pip3 install mitmproxy --quiet --break-system-packages 2>&1 | tail -3
           mkdir -p /tmp/artifacts/network
-
-          # Generate CA cert by running mitmdump briefly
           mitmdump -p 8889 --set block_global=false &
           MPID=$!; sleep 8; kill $MPID 2>/dev/null || true
-          ls -lh ~/.mitmproxy/
-
-          # Trust CA in simulator BEFORE any app launch
-          SIM_ID="${{ env.SIM_ID }}"
-          xcrun simctl keychain "$SIM_ID" add-root-cert ~/.mitmproxy/mitmproxy-ca-cert.pem
+          xcrun simctl keychain "${{ env.SIM_ID }}" add-root-cert ~/.mitmproxy/mitmproxy-ca-cert.pem
           echo "mitmproxy CA trusted"
-
-          # Set proxy via simctl environment (affects all launched processes)
-          # Store in GITHUB_ENV so subsequent steps inherit
-          echo "MITM_PORT=8888" >> $GITHUB_ENV
 
       - name: Build SSL kill-switch dylib
         run: |
-          # Minimal dylib that no-ops TLS cert validation in simulator
           cat > /tmp/ssl_killswitch.m << 'CEOF'
           #include <Security/Security.h>
           Boolean SecTrustEvaluateWithError(SecTrustRef t, CFErrorRef *e) {
@@ -388,7 +497,6 @@ jobs:
               if (r) *r = kSecTrustResultProceed; return 0;
           }
           CEOF
-
           SDK=$(xcrun --sdk iphonesimulator --show-sdk-path)
           clang -arch arm64 -dynamiclib \
             -target arm64-apple-ios16.0-simulator \
@@ -396,44 +504,25 @@ jobs:
             -framework Security \
             -o /tmp/ssl_killswitch.dylib \
             /tmp/ssl_killswitch.m 2>&1 \
-          && echo "SSL kill-switch built OK" \
-          || echo "Build failed — will run without SSL bypass"
-          ls -lh /tmp/ssl_killswitch.dylib 2>/dev/null || true
+          && echo "SSL kill-switch OK" || echo "Build failed — running without SSL bypass"
 
       - name: Capture Tripsy network traffic
         run: |
           SIM_ID="${{ env.SIM_ID }}"
           xcrun simctl terminate "$SIM_ID" "app.tripsy.ios" 2>/dev/null || true
           sleep 2
-
-          # Start mitmproxy
-          mitmdump -p 8888 \
-            --save-stream-file /tmp/artifacts/network/tripsy_traffic.mitm \
+          mitmdump -p 8888 --save-stream-file /tmp/artifacts/network/tripsy_traffic.mitm \
             --set block_global=false -q &
           MPID=$!; sleep 3
-
-          # Launch with proxy env vars + SSL bypass dylib
-          if [ -f /tmp/ssl_killswitch.dylib ]; then
-            xcrun simctl launch --terminate-running-process \
-              "$SIM_ID" "app.tripsy.ios" \
-              DYLD_INSERT_LIBRARIES=/tmp/ssl_killswitch.dylib \
-              https_proxy=http://127.0.0.1:8888 \
-              http_proxy=http://127.0.0.1:8888 2>&1 || \
-            xcrun simctl launch --terminate-running-process \
-              "$SIM_ID" "app.tripsy.ios" \
-              https_proxy=http://127.0.0.1:8888 \
-              http_proxy=http://127.0.0.1:8888 2>&1 || true
-          else
-            xcrun simctl launch --terminate-running-process \
-              "$SIM_ID" "app.tripsy.ios" \
-              https_proxy=http://127.0.0.1:8888 \
-              http_proxy=http://127.0.0.1:8888 2>&1 || true
-          fi
-
-          echo "Capturing Tripsy traffic for 45s..."
-          sleep 45
+          DYLD_ARG=""
+          [ -f /tmp/ssl_killswitch.dylib ] && DYLD_ARG="DYLD_INSERT_LIBRARIES=/tmp/ssl_killswitch.dylib"
+          xcrun simctl launch --terminate-running-process "$SIM_ID" "app.tripsy.ios" \
+            $DYLD_ARG \
+            https_proxy=http://127.0.0.1:8888 \
+            http_proxy=http://127.0.0.1:8888 2>&1 || true
+          echo "Capturing 45s..."; sleep 45
           kill $MPID 2>/dev/null; sleep 2
-          echo "Tripsy .mitm: $(wc -c < /tmp/artifacts/network/tripsy_traffic.mitm 2>/dev/null || echo 0) bytes"
+          echo "Tripsy traffic: $(wc -c < /tmp/artifacts/network/tripsy_traffic.mitm 2>/dev/null || echo 0) bytes"
 
       - name: Capture Wanderlog network traffic
         run: |
@@ -441,40 +530,24 @@ jobs:
           xcrun simctl terminate "$SIM_ID" "app.tripsy.ios" 2>/dev/null || true
           xcrun simctl terminate "$SIM_ID" "com.wanderlog.ios" 2>/dev/null || true
           sleep 2
-
-          mitmdump -p 8888 \
-            --save-stream-file /tmp/artifacts/network/wanderlog_traffic.mitm \
+          mitmdump -p 8888 --save-stream-file /tmp/artifacts/network/wanderlog_traffic.mitm \
             --set block_global=false -q &
           MPID=$!; sleep 3
-
-          if [ -f /tmp/ssl_killswitch.dylib ]; then
-            xcrun simctl launch --terminate-running-process \
-              "$SIM_ID" "com.wanderlog.ios" \
-              DYLD_INSERT_LIBRARIES=/tmp/ssl_killswitch.dylib \
-              https_proxy=http://127.0.0.1:8888 \
-              http_proxy=http://127.0.0.1:8888 2>&1 || \
-            xcrun simctl launch --terminate-running-process \
-              "$SIM_ID" "com.wanderlog.ios" \
-              https_proxy=http://127.0.0.1:8888 \
-              http_proxy=http://127.0.0.1:8888 2>&1 || true
-          else
-            xcrun simctl launch --terminate-running-process \
-              "$SIM_ID" "com.wanderlog.ios" \
-              https_proxy=http://127.0.0.1:8888 \
-              http_proxy=http://127.0.0.1:8888 2>&1 || true
-          fi
-
-          echo "Capturing Wanderlog traffic for 45s..."
-          sleep 45
+          DYLD_ARG=""
+          [ -f /tmp/ssl_killswitch.dylib ] && DYLD_ARG="DYLD_INSERT_LIBRARIES=/tmp/ssl_killswitch.dylib"
+          xcrun simctl launch --terminate-running-process "$SIM_ID" "com.wanderlog.ios" \
+            $DYLD_ARG \
+            https_proxy=http://127.0.0.1:8888 \
+            http_proxy=http://127.0.0.1:8888 2>&1 || true
+          echo "Capturing 45s..."; sleep 45
           kill $MPID 2>/dev/null; sleep 2
-          echo "Wanderlog .mitm: $(wc -c < /tmp/artifacts/network/wanderlog_traffic.mitm 2>/dev/null || echo 0) bytes"
+          echo "Wanderlog traffic: $(wc -c < /tmp/artifacts/network/wanderlog_traffic.mitm 2>/dev/null || echo 0) bytes"
 
       - name: Parse network flows to JSON
         if: always()
         run: |
           python3 << 'PYEOF'
           import json, os
-
           def parse_flows(mitm_path, out_path):
               size = os.path.getsize(mitm_path) if os.path.exists(mitm_path) else 0
               print(f"{os.path.basename(mitm_path)}: {size} bytes")
@@ -489,56 +562,49 @@ jobs:
                           if isinstance(flow, http.HTTPFlow):
                               req, resp = flow.request, flow.response
                               flows.append({
-                                  "method": req.method,
-                                  "url": req.pretty_url,
+                                  "method": req.method, "url": req.pretty_url,
                                   "req_headers": dict(req.headers),
                                   "req_body": req.text[:3000] if req.content else None,
                                   "status": resp.status_code if resp else None,
                                   "resp_headers": dict(resp.headers) if resp else {},
                                   "resp_body": resp.text[:5000] if resp and resp.content else None,
                               })
-                  with open(out_path, "w") as f:
-                      json.dump(flows, f, indent=2)
+                  with open(out_path, "w") as f: json.dump(flows, f, indent=2)
                   print(f"  -> {len(flows)} flows")
               except Exception as e:
                   print(f"  -> parse error: {e}")
                   with open(out_path, "w") as f: json.dump([], f)
 
           for fname in ["tripsy_traffic", "wanderlog_traffic"]:
-              parse_flows(
-                  f"/tmp/artifacts/network/{fname}.mitm",
-                  f"/tmp/artifacts/network/{fname}.json",
-              )
+              parse_flows(f"/tmp/artifacts/network/{fname}.mitm",
+                          f"/tmp/artifacts/network/{fname}.json")
           PYEOF
 
       # ─── UPLOAD ────────────────────────────────────────────────────────────
 
-      - name: List all artifacts
+      - name: List artifacts
         if: always()
         run: |
-          echo "=== Artifacts collected ==="
+          echo "=== All artifacts ==="
           find /tmp/artifacts -type f | sort
           echo ""
-          echo "=== Screenshot count ==="
-          ls /tmp/artifacts/tripsy-screenshots/*.png 2>/dev/null | wc -l || echo "0"
-          ls /tmp/artifacts/wanderlog-screenshots/*.png 2>/dev/null | wc -l || echo "0"
+          echo "Tripsy screenshots: $(ls /tmp/artifacts/tripsy-screenshots/*.png 2>/dev/null | wc -l)"
+          echo "Wanderlog screenshots: $(ls /tmp/artifacts/wanderlog-screenshots/*.png 2>/dev/null | wc -l)"
 
-      - name: Upload tripsy-dynamic artifacts
+      - name: Upload tripsy-dynamic
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: tripsy-dynamic
-          path: |
-            /tmp/artifacts/tripsy-*
+          path: /tmp/artifacts/tripsy-*
           retention-days: 30
 
-      - name: Upload wanderlog-dynamic artifacts
+      - name: Upload wanderlog-dynamic
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: wanderlog-dynamic
-          path: |
-            /tmp/artifacts/wanderlog-*
+          path: /tmp/artifacts/wanderlog-*
           retention-days: 30
 
       - name: Upload network artifacts
