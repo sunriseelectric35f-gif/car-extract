@@ -345,7 +345,7 @@ jobs:
 
       - name: Setup mitmproxy + capture network for both apps
         run: |
-          pip3 install mitmproxy --quiet 2>&1 | tail -3
+          pip3 install mitmproxy --quiet --break-system-packages 2>&1 | tail -3
 
           mkdir -p /tmp/artifacts/network
 
