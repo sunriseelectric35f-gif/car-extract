@@ -69,12 +69,15 @@ jobs:
           echo "Cert trusted in simulator"
 
           # Configure macOS system proxy → simulator URLSession uses this automatically
-          for svc in "Wi-Fi" "Ethernet" "USB 10/100/1000 LAN" "Thunderbolt Bridge"; do
+          # Configure macOS system proxy — enumerate real service names (runner may use "Ethernet 1" etc.)
+          while IFS= read -r svc; do
+            [[ "$svc" =~ ^An ]] && continue  # skip "An asterisk..." header line
+            svc="${svc#\*}"  # strip leading asterisk for disabled services
             networksetup -setwebproxy "$svc" 127.0.0.1 8888 off 2>/dev/null || true
             networksetup -setsecurewebproxy "$svc" 127.0.0.1 8888 off 2>/dev/null || true
             networksetup -setwebproxystate "$svc" on 2>/dev/null || true
             networksetup -setsecurewebproxystate "$svc" on 2>/dev/null || true
-          done
+          done < <(networksetup -listallnetworkservices 2>/dev/null)
 
           # Verify
           echo "=== Proxy settings ===" && scutil --proxy | grep -E "Enabled|Port|Proxy" | head -10
@@ -86,22 +89,29 @@ jobs:
       - name: Build SSL kill-switch dylib
         run: |
           cat > /tmp/ssl_killswitch.m << 'CEOF'
-          #include <Security/Security.h>
           #import <Foundation/Foundation.h>
+          #include <Security/Security.h>
           #include <objc/runtime.h>
 
-          // ── C-level overrides ─────────────────────────────────────────────
-          Boolean SecTrustEvaluateWithError(SecTrustRef t, CFErrorRef *e) {
+          // ── C-level interposition (DYLD_INTERPOSE avoids conflicting-type redeclaration) ──
+          // Xcode 15+ SDK declares SecTrustEvaluateWithError returning `bool` not `Boolean`
+          #define DYLD_INTERPOSE(_new, _old) \
+              __attribute__((used)) static struct { const void *r; const void *o; } \
+              _interpose_##_old __attribute__((section("__DATA,__interpose"))) = \
+              { (const void *)(unsigned long)&_new, (const void *)(unsigned long)&_old }
+
+          static bool my_SecTrustEvaluateWithError(SecTrustRef t, CFErrorRef *e) {
               if (e) *e = NULL; return true;
           }
-          OSStatus SecTrustEvaluate(SecTrustRef t, SecTrustResultType *r) {
+          static OSStatus my_SecTrustEvaluate(SecTrustRef t, SecTrustResultType *r) {
               if (r) *r = kSecTrustResultProceed; return 0;
           }
-          OSStatus SecTrustGetTrustResult(SecTrustRef t, SecTrustResultType *r) {
+          static OSStatus my_SecTrustGetTrustResult(SecTrustRef t, SecTrustResultType *r) {
               if (r) *r = kSecTrustResultProceed; return 0;
           }
-          // Prevent pinned cert comparison functions from returning useful data
-          CF_RETURNS_RETAINED CFArrayRef SecTrustCopyMatchingIssuers(SecTrustRef trust) { return NULL; }
+          DYLD_INTERPOSE(my_SecTrustEvaluateWithError, SecTrustEvaluateWithError)
+          DYLD_INTERPOSE(my_SecTrustEvaluate, SecTrustEvaluate)
+          DYLD_INTERPOSE(my_SecTrustGetTrustResult, SecTrustGetTrustResult)
 
           // ── ObjC-level challenge bypass ────────────────────────────────────
           // Hooks ALL classes implementing URLSession challenge delegates.
@@ -212,7 +222,9 @@ jobs:
           patch_macho "$APP_PATH/$APP_NAME"
           find "$APP_PATH/Frameworks" -type f 2>/dev/null | while read f; do patch_macho "$f"; done
 
-          find "$APP_PATH/Frameworks" -maxdepth 2 -type f -exec codesign --remove-signature {} \; 2>/dev/null || true
+          find "$APP_PATH/Frameworks" -maxdepth 2 -type f | while read f; do
+            file "$f" 2>/dev/null | grep -qE "Mach-O" && codesign --remove-signature "$f" 2>/dev/null || true
+          done
           codesign --remove-signature "$APP_PATH/$APP_NAME" 2>/dev/null || true
           codesign --remove-signature "$APP_PATH" 2>/dev/null || true
           find "$APP_PATH/Frameworks" -maxdepth 1 \( -name "*.framework" -o -name "*.dylib" \) | while read fw; do
@@ -360,7 +372,9 @@ jobs:
           patch_macho "$WL_APP/$APP_NAME"
           find "$WL_APP/Frameworks" -type f 2>/dev/null | while read f; do patch_macho "$f"; done
 
-          find "$WL_APP/Frameworks" -maxdepth 2 -type f -exec codesign --remove-signature {} \; 2>/dev/null || true
+          find "$WL_APP/Frameworks" -maxdepth 2 -type f | while read f; do
+            file "$f" 2>/dev/null | grep -qE "Mach-O" && codesign --remove-signature "$f" 2>/dev/null || true
+          done
           codesign --remove-signature "$WL_APP/$APP_NAME" 2>/dev/null || true
           codesign --remove-signature "$WL_APP" 2>/dev/null || true
           find "$WL_APP/Frameworks" -maxdepth 1 \( -name "*.framework" -o -name "*.dylib" \) | while read fw; do
@@ -485,10 +499,12 @@ jobs:
       - name: Cleanup system proxy
         if: always()
         run: |
-          for svc in "Wi-Fi" "Ethernet" "USB 10/100/1000 LAN" "Thunderbolt Bridge"; do
+          while IFS= read -r svc; do
+            [[ "$svc" =~ ^An ]] && continue
+            svc="${svc#\*}"
             networksetup -setwebproxystate "$svc" off 2>/dev/null || true
             networksetup -setsecurewebproxystate "$svc" off 2>/dev/null || true
-          done
+          done < <(networksetup -listallnetworkservices 2>/dev/null)
           echo "System proxy disabled"
 
       - name: List artifacts
