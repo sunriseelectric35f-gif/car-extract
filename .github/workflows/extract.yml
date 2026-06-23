@@ -1,0 +1,59 @@
+name: Extract Assets.car
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  extract:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - name: Build cartool
+        run: |
+          git clone --depth 1 https://github.com/steventroughtonsmith/cartool.git /tmp/cartool
+          cd /tmp/cartool
+          xcodebuild \
+            -scheme cartool \
+            -configuration Release \
+            -derivedDataPath /tmp/cartool-build \
+            ONLY_ACTIVE_ARCH=NO \
+            BUILD_LIBRARY_FOR_DISTRIBUTION=NO \
+            2>&1 | tail -20
+          find /tmp/cartool-build -name "cartool" -type f | head -3
+
+      - name: Extract Tripsy
+        run: |
+          CARTOOL=$(find /tmp/cartool-build -name "cartool" -type f | head -1)
+          echo "Using: $CARTOOL"
+          mkdir -p output/tripsy
+          "$CARTOOL" Tripsy.car output/tripsy/ 2>&1 | tail -5
+          echo "Extracted: $(ls output/tripsy/ | wc -l) files"
+          ls output/tripsy/ | head -20
+
+      - name: Extract Wanderlog
+        run: |
+          CARTOOL=$(find /tmp/cartool-build -name "cartool" -type f | head -1)
+          mkdir -p output/wanderlog
+          "$CARTOOL" Wanderlog.car output/wanderlog/ 2>&1 | tail -5
+          echo "Extracted: $(ls output/wanderlog/ | wc -l) files"
+          ls output/wanderlog/ | head -20
+
+      - name: Upload Tripsy assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: tripsy-assets
+          path: output/tripsy/
+          retention-days: 7
+
+      - name: Upload Wanderlog assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: wanderlog-assets
+          path: output/wanderlog/
+          retention-days: 7
