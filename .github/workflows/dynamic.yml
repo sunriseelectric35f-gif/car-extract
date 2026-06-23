@@ -27,7 +27,6 @@ jobs:
 
       - name: Select + boot simulator
         run: |
-          xcrun simctl list devices available | grep iPhone | head -10
           SIM_ID=$(xcrun simctl list devices available -j | python3 -c "
           import sys, json
           data = json.load(sys.stdin)
@@ -36,7 +35,6 @@ jobs:
                   for d in devices:
                       if d['isAvailable'] and 'iPhone 16' in d['name']:
                           print(d['udid']); raise SystemExit(0)
-          # fallback: any iPhone
           for runtime, devices in data['devices'].items():
               if 'iOS-18' in runtime or 'iOS-17' in runtime:
                   for d in devices:
@@ -50,6 +48,136 @@ jobs:
           xcrun simctl boot "$SIM_ID" 2>/dev/null || true
           xcrun simctl bootstatus "$SIM_ID" -b
           echo "Simulator ready"
+
+      # ─── MITMPROXY + SYSTEM PROXY SETUP ────────────────────────────────────
+      # PRIMARY FIX: iOS URLSession ignores https_proxy env vars.
+      # It uses macOS system proxy settings (scutil --proxy).
+      # networksetup writes to the same store — simulator picks it up automatically.
+
+      - name: Setup mitmproxy + system proxy
+        run: |
+          pip3 install mitmproxy --quiet --break-system-packages 2>&1 | tail -3
+          mkdir -p /tmp/artifacts/network
+
+          # Generate mitmproxy CA cert
+          mitmdump -p 8889 --set block_global=false -q &
+          MPID=$!; sleep 8; kill $MPID 2>/dev/null || true
+          echo "CA cert: $(ls -lh ~/.mitmproxy/mitmproxy-ca-cert.pem)"
+
+          # Trust in simulator keychain BEFORE any app launch
+          xcrun simctl keychain "${{ env.SIM_ID }}" add-root-cert ~/.mitmproxy/mitmproxy-ca-cert.pem
+          echo "Cert trusted in simulator"
+
+          # Configure macOS system proxy → simulator URLSession uses this automatically
+          for svc in "Wi-Fi" "Ethernet" "USB 10/100/1000 LAN" "Thunderbolt Bridge"; do
+            networksetup -setwebproxy "$svc" 127.0.0.1 8888 off 2>/dev/null || true
+            networksetup -setsecurewebproxy "$svc" 127.0.0.1 8888 off 2>/dev/null || true
+            networksetup -setwebproxystate "$svc" on 2>/dev/null || true
+            networksetup -setsecurewebproxystate "$svc" on 2>/dev/null || true
+          done
+
+          # Verify
+          echo "=== Proxy settings ===" && scutil --proxy | grep -E "Enabled|Port|Proxy" | head -10
+
+      # ─── SSL KILL-SWITCH DYLIB (v2 — ObjC swizzling) ──────────────────────
+      # Overrides both C-level SecTrust functions AND ObjC URLSession challenge delegates.
+      # Required because Tripsy uses custom URLSession:task:didReceiveChallenge: pinning.
+
+      - name: Build SSL kill-switch dylib
+        run: |
+          cat > /tmp/ssl_killswitch.m << 'CEOF'
+          #include <Security/Security.h>
+          #import <Foundation/Foundation.h>
+          #include <objc/runtime.h>
+
+          // ── C-level overrides ─────────────────────────────────────────────
+          Boolean SecTrustEvaluateWithError(SecTrustRef t, CFErrorRef *e) {
+              if (e) *e = NULL; return true;
+          }
+          OSStatus SecTrustEvaluate(SecTrustRef t, SecTrustResultType *r) {
+              if (r) *r = kSecTrustResultProceed; return 0;
+          }
+          OSStatus SecTrustGetTrustResult(SecTrustRef t, SecTrustResultType *r) {
+              if (r) *r = kSecTrustResultProceed; return 0;
+          }
+          // Prevent pinned cert comparison functions from returning useful data
+          CF_RETURNS_RETAINED CFArrayRef SecTrustCopyMatchingIssuers(SecTrustRef trust) { return NULL; }
+
+          // ── ObjC-level challenge bypass ────────────────────────────────────
+          // Hooks ALL classes implementing URLSession challenge delegates.
+          // This bypasses custom delegate-based cert pinning (Tripsy pattern).
+
+          static void bypass_task_challenge(
+              id self, SEL _cmd,
+              NSURLSession *session, NSURLSessionTask *task,
+              NSURLAuthenticationChallenge *challenge,
+              void (^handler)(NSURLSessionAuthChallengeDisposition, NSURLCredential *)
+          ) {
+              NSString *method = [[challenge protectionSpace] authenticationMethod];
+              if ([method isEqualToString:NSURLAuthenticationMethodServerTrust]) {
+                  SecTrustRef trust = [[challenge protectionSpace] serverTrust];
+                  NSURLCredential *cred = [NSURLCredential credentialForTrust:trust];
+                  handler(NSURLSessionAuthChallengeUseCredential, cred);
+              } else {
+                  handler(NSURLSessionAuthChallengePerformDefaultHandling, nil);
+              }
+          }
+
+          static void bypass_session_challenge(
+              id self, SEL _cmd,
+              NSURLSession *session,
+              NSURLAuthenticationChallenge *challenge,
+              void (^handler)(NSURLSessionAuthChallengeDisposition, NSURLCredential *)
+          ) {
+              NSString *method = [[challenge protectionSpace] authenticationMethod];
+              if ([method isEqualToString:NSURLAuthenticationMethodServerTrust]) {
+                  SecTrustRef trust = [[challenge protectionSpace] serverTrust];
+                  NSURLCredential *cred = [NSURLCredential credentialForTrust:trust];
+                  handler(NSURLSessionAuthChallengeUseCredential, cred);
+              } else {
+                  handler(NSURLSessionAuthChallengePerformDefaultHandling, nil);
+              }
+          }
+
+          __attribute__((constructor))
+          static void ssl_killswitch_init() {
+              // Delay to allow Swift runtime to register all classes
+              dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
+                             dispatch_get_main_queue(), ^{
+                  unsigned int count;
+                  Class *classes = objc_copyClassList(&count);
+
+                  SEL taskSel = NSSelectorFromString(@"URLSession:task:didReceiveChallenge:completionHandler:");
+                  SEL sessSel = NSSelectorFromString(@"URLSession:didReceiveChallenge:completionHandler:");
+
+                  int hooked = 0;
+                  for (unsigned int i = 0; i < count; i++) {
+                      Class cls = classes[i];
+                      Method m;
+                      if ((m = class_getInstanceMethod(cls, taskSel))) {
+                          method_setImplementation(m, (IMP)bypass_task_challenge);
+                          hooked++;
+                      }
+                      if ((m = class_getInstanceMethod(cls, sessSel))) {
+                          method_setImplementation(m, (IMP)bypass_session_challenge);
+                          hooked++;
+                      }
+                  }
+                  free(classes);
+                  NSLog(@"[ssl-killswitch] hooked %d challenge handlers", hooked);
+              });
+          }
+          CEOF
+
+          SDK=$(xcrun --sdk iphonesimulator --show-sdk-path)
+          clang -arch arm64 -dynamiclib \
+            -target arm64-apple-ios16.0-simulator \
+            -isysroot "$SDK" \
+            -framework Security \
+            -framework Foundation \
+            -o /tmp/ssl_killswitch.dylib \
+            /tmp/ssl_killswitch.m 2>&1 \
+          && echo "SSL kill-switch v2 built OK" || echo "Build failed — proceeding without"
 
       # ─── TRIPSY ────────────────────────────────────────────────────────────
 
@@ -106,60 +234,46 @@ jobs:
           idx = raw.find('[')
           data = json.loads(raw[idx:]) if idx >= 0 else []
           colors = [x for x in data if x.get("AssetType") == "Color"]
-          out = []
+          out = {}
           for c in colors:
-            comps = c.get("Color components", {})
-            def tohex(comps):
-              try:
-                r = round(float(comps.get("red",0))*255)
-                g = round(float(comps.get("green",0))*255)
-                b = round(float(comps.get("blue",0))*255)
-                return f"#{r:02X}{g:02X}{b:02X}"
-              except: return None
-            name = c.get("Name","?")
-            hex_val = tohex(comps) if comps else None
-            out.append({"name": name, "hex": hex_val, "appearances": c.get("Appearances",[])})
+              name = c.get("Name", "?")
+              rgba = c.get("Color components", [])
+              appearance = c.get("Appearance", "Any")
+              if len(rgba) >= 3:
+                  r,g,b = int(rgba[0]*255), int(rgba[1]*255), int(rgba[2]*255)
+                  hex_val = f"#{r:02X}{g:02X}{b:02X}"
+              else:
+                  hex_val = None
+              if name not in out: out[name] = {}
+              out[name][appearance] = hex_val
           with open("/tmp/artifacts/tripsy-colors/colors.json","w") as f:
-            json.dump(out, f, indent=2)
-          print(f"Extracted {len(out)} Tripsy colors")
+              json.dump(out, f, indent=2)
+          print(f"Extracted {len(colors)} color entries, {len(out)} named colors")
           PYEOF
 
-      - name: Launch Tripsy + run Maestro flow
+      - name: Launch Tripsy + Maestro flow
         run: |
           SIM_ID="${{ env.SIM_ID }}"
           BUNDLE_ID="app.tripsy.ios"
           OUT="/tmp/artifacts/tripsy-screenshots"
           mkdir -p "$OUT" /tmp/maestro
 
-          # Launch via simctl (reliable — doesn't need XCTest signing)
           echo "Launching Tripsy..."
           xcrun simctl launch "$SIM_ID" "$BUNDLE_ID" 2>&1 || true
-          # Wait for app to fully render (Swift app, first cold boot)
           sleep 18
 
-          # Check if app process is alive
-          xcrun simctl spawn "$SIM_ID" launchctl list 2>/dev/null | grep tripsy || echo "tripsy not in launchctl"
-
-          # Capture launch screenshot via simctl (before Maestro touches anything)
           xcrun simctl io "$SIM_ID" screenshot "$OUT/00_launch_raw.png" 2>/dev/null || true
 
-          # Maestro flow — stored as base64 to avoid --- clashing with YAML doc separator
           TRIPSY_FLOW_B64="YXBwSWQ6IGFwcC50cmlwc3kuaW9zCi0tLQotIHdhaXRGb3JBbmltYXRpb25Ub0VuZDoKICAgIHRpbWVvdXQ6IDUwMDAKLSB0YWtlU2NyZWVuc2hvdDogdHJpcHN5XzAxX2luaXRpYWwKLSBydW5GbG93OgogICAgd2hlbjoKICAgICAgdmlzaWJsZTogIkFsbG93IgogICAgY29tbWFuZHM6CiAgICAgIC0gdGFwT246ICJBbGxvdyIKICAgICAgLSB3YWl0Rm9yQW5pbWF0aW9uVG9FbmQKLSBydW5GbG93OgogICAgd2hlbjoKICAgICAgdmlzaWJsZTogIk9LIgogICAgY29tbWFuZHM6CiAgICAgIC0gdGFwT246ICJPSyIKICAgICAgLSB3YWl0Rm9yQW5pbWF0aW9uVG9FbmQKLSB0YWtlU2NyZWVuc2hvdDogdHJpcHN5XzAyX3Blcm1pc3Npb25zX2RvbmUKLSBydW5GbG93OgogICAgd2hlbjoKICAgICAgdmlzaWJsZTogIkdldCBTdGFydGVkIgogICAgY29tbWFuZHM6CiAgICAgIC0gdGFwT246ICJHZXQgU3RhcnRlZCIKICAgICAgLSB3YWl0Rm9yQW5pbWF0aW9uVG9FbmQ6CiAgICAgICAgICB0aW1lb3V0OiA1MDAwCiAgICAgIC0gdGFrZVNjcmVlbnNob3Q6IHRyaXBzeV8wM19hZnRlcl9nZXRzdGFydGVkCi0gcmVwZWF0OgogICAgdGltZXM6IDgKICAgIGNvbW1hbmRzOgogICAgICAtIHJ1bkZsb3c6CiAgICAgICAgICB3aGVuOgogICAgICAgICAgICB2aXNpYmxlOiAiTmV4dCIKICAgICAgICAgIGNvbW1hbmRzOgogICAgICAgICAgICAtIHRhcE9uOiAiTmV4dCIKICAgICAgICAgICAgLSB3YWl0Rm9yQW5pbWF0aW9uVG9FbmQ6CiAgICAgICAgICAgICAgICB0aW1lb3V0OiAzMDAwCiAgICAgICAgICAgIC0gdGFrZVNjcmVlbnNob3Q6IHRyaXBzeV9zbGlkZV9uZXh0CiAgICAgIC0gcnVuRmxvdzoKICAgICAgICAgIHdoZW46CiAgICAgICAgICAgIHZpc2libGU6ICJDb250aW51ZSIKICAgICAgICAgIGNvbW1hbmRzOgogICAgICAgICAgICAtIHRhcE9uOiAiQ29udGludWUiCiAgICAgICAgICAgIC0gd2FpdEZvckFuaW1hdGlvblRvRW5kOgogICAgICAgICAgICAgICAgdGltZW91dDogMzAwMAogICAgICAgICAgICAtIHRha2VTY3JlZW5zaG90OiB0cmlwc3lfc2xpZGVfY29udGludWUKLSBydW5GbG93OgogICAgd2hlbjoKICAgICAgdmlzaWJsZTogIlNraXAiCiAgICBjb21tYW5kczoKICAgICAgLSB0YXBPbjogIlNraXAiCiAgICAgIC0gd2FpdEZvckFuaW1hdGlvblRvRW5kOgogICAgICAgICAgdGltZW91dDogMzAwMAogICAgICAtIHRha2VTY3JlZW5zaG90OiB0cmlwc3lfc2tpcAotIHJ1bkZsb3c6CiAgICB3aGVuOgogICAgICB2aXNpYmxlOiAiTWF5YmUgTGF0ZXIiCiAgICBjb21tYW5kczoKICAgICAgLSB0YXBPbjogIk1heWJlIExhdGVyIgogICAgICAtIHdhaXRGb3JBbmltYXRpb25Ub0VuZAotIHRha2VTY3JlZW5zaG90OiB0cmlwc3lfMDRfcG9zdF9vbmJvYXJkaW5nCi0gcnVuRmxvdzoKICAgIHdoZW46CiAgICAgIHZpc2libGU6ICJUcmlwcyIKICAgIGNvbW1hbmRzOgogICAgICAtIHRhcE9uOiAiVHJpcHMiCiAgICAgIC0gd2FpdEZvckFuaW1hdGlvblRvRW5kOgogICAgICAgICAgdGltZW91dDogMzAwMAogICAgICAtIHRha2VTY3JlZW5zaG90OiB0cmlwc3lfMDVfdHJpcHNfdGFiCi0gcnVuRmxvdzoKICAgIHdoZW46CiAgICAgIHZpc2libGU6ICJFeHBsb3JlIgogICAgY29tbWFuZHM6CiAgICAgIC0gdGFwT246ICJFeHBsb3JlIgogICAgICAtIHdhaXRGb3JBbmltYXRpb25Ub0VuZDoKICAgICAgICAgIHRpbWVvdXQ6IDMwMDAKICAgICAgLSB0YWtlU2NyZWVuc2hvdDogdHJpcHN5XzA2X2V4cGxvcmVfdGFiCi0gcnVuRmxvdzoKICAgIHdoZW46CiAgICAgIHZpc2libGU6ICJUb2RheSIKICAgIGNvbW1hbmRzOgogICAgICAtIHRhcE9uOiAiVG9kYXkiCiAgICAgIC0gd2FpdEZvckFuaW1hdGlvblRvRW5kOgogICAgICAgICAgdGltZW91dDogMzAwMAogICAgICAtIHRha2VTY3JlZW5zaG90OiB0cmlwc3lfMDdfdG9kYXlfdGFiCi0gcnVuRmxvdzoKICAgIHdoZW46CiAgICAgIHZpc2libGU6ICJTZXR0aW5ncyIKICAgIGNvbW1hbmRzOgogICAgICAtIHRhcE9uOiAiU2V0dGluZ3MiCiAgICAgIC0gd2FpdEZvckFuaW1hdGlvblRvRW5kOgogICAgICAgICAgdGltZW91dDogMzAwMAogICAgICAtIHRha2VTY3JlZW5zaG90OiB0cmlwc3lfMDhfc2V0dGluZ3MKLSB0YWtlU2NyZWVuc2hvdDogdHJpcHN5XzA5X2ZpbmFsCg=="
           echo "$TRIPSY_FLOW_B64" | base64 --decode > /tmp/maestro/tripsy_flow.yaml
-          echo "Flow lines: $(wc -l < /tmp/maestro/tripsy_flow.yaml)"
 
-          # Run Maestro against the already-running app
           maestro --device "$SIM_ID" test /tmp/maestro/tripsy_flow.yaml \
             2>&1 | tee "$OUT/maestro_log.txt" || true
 
-          # Maestro saves screenshots to ~/.maestro/tests/<timestamp>/
           MAESTRO_OUT=$(ls -td ~/.maestro/tests/*/ 2>/dev/null | head -1)
           if [ -n "$MAESTRO_OUT" ]; then
-            echo "Maestro output dir: $MAESTRO_OUT"
-            ls "$MAESTRO_OUT" || true
             find "$MAESTRO_OUT" -name "*.png" -exec cp {} "$OUT/" \; 2>/dev/null || true
           fi
-
           echo "Total screenshots: $(ls $OUT/*.png 2>/dev/null | wc -l)"
 
       - name: Dump Tripsy container
@@ -179,6 +293,36 @@ jobs:
           else
             echo "No container"
           fi
+
+      # ─── NETWORK CAPTURE — TRIPSY ──────────────────────────────────────────
+      # System proxy is already active (set in "Setup mitmproxy + system proxy" step).
+      # URLSession picks up macOS scutil --proxy automatically — no env vars needed.
+      # Kill-switch dylib injected via DYLD_INSERT_LIBRARIES to bypass ObjC delegate pinning.
+
+      - name: Capture Tripsy network traffic
+        run: |
+          SIM_ID="${{ env.SIM_ID }}"
+          BUNDLE_ID="app.tripsy.ios"
+
+          xcrun simctl terminate "$SIM_ID" "$BUNDLE_ID" 2>/dev/null || true
+          sleep 2
+
+          mitmdump -p 8888 \
+            --save-stream-file /tmp/artifacts/network/tripsy_traffic.mitm \
+            --set block_global=false -q &
+          MPID=$!; sleep 3
+
+          if [ -f /tmp/ssl_killswitch.dylib ]; then
+            xcrun simctl launch --terminate-running-process "$SIM_ID" "$BUNDLE_ID" \
+              DYLD_INSERT_LIBRARIES=/tmp/ssl_killswitch.dylib 2>&1 || true
+          else
+            xcrun simctl launch "$SIM_ID" "$BUNDLE_ID" 2>&1 || true
+          fi
+
+          echo "Capturing 60s..."
+          sleep 60
+          kill $MPID 2>/dev/null; sleep 2
+          echo "Tripsy traffic: $(wc -c < /tmp/artifacts/network/tripsy_traffic.mitm) bytes"
 
       # ─── WANDERLOG ─────────────────────────────────────────────────────────
 
@@ -226,7 +370,7 @@ jobs:
           xcrun simctl install "$SIM_ID" "$WL_APP"
           echo "Wanderlog installed"
 
-      - name: Launch Wanderlog + run Maestro flow
+      - name: Launch Wanderlog + Maestro flow
         run: |
           SIM_ID="${{ env.SIM_ID }}"
           BUNDLE_ID="com.wanderlog.ios"
@@ -235,15 +379,12 @@ jobs:
 
           echo "Launching Wanderlog..."
           xcrun simctl launch "$SIM_ID" "$BUNDLE_ID" 2>&1 || true
-          # RN/Hermes app needs longer to load JS bundle
           sleep 22
 
           xcrun simctl io "$SIM_ID" screenshot "$OUT/00_launch_raw.png" 2>/dev/null || true
 
-          # Wanderlog Maestro flow — base64 encoded
           WANDERLOG_FLOW_B64="YXBwSWQ6IGNvbS53YW5kZXJsb2cuaW9zCi0tLQotIHdhaXRGb3JBbmltYXRpb25Ub0VuZDoKICAgIHRpbWVvdXQ6IDgwMDAKLSB0YWtlU2NyZWVuc2hvdDogd2FuZGVybG9nXzAxX2xvYWRlZAotIHJ1bkZsb3c6CiAgICB3aGVuOgogICAgICB2aXNpYmxlOiAiQWxsb3ciCiAgICBjb21tYW5kczoKICAgICAgLSB0YXBPbjogIkFsbG93IgogICAgICAtIHdhaXRGb3JBbmltYXRpb25Ub0VuZAotIHRha2VTY3JlZW5zaG90OiB3YW5kZXJsb2dfMDJfcGVybWlzc2lvbnNfZG9uZQotIHJ1bkZsb3c6CiAgICB3aGVuOgogICAgICB2aXNpYmxlOiAiR2V0IHN0YXJ0ZWQiCiAgICBjb21tYW5kczoKICAgICAgLSB0YXBPbjogIkdldCBzdGFydGVkIgogICAgICAtIHdhaXRGb3JBbmltYXRpb25Ub0VuZDoKICAgICAgICAgIHRpbWVvdXQ6IDUwMDAKICAgICAgLSB0YWtlU2NyZWVuc2hvdDogd2FuZGVybG9nXzAzX2FmdGVyX2dldHN0YXJ0ZWQKLSBydW5GbG93OgogICAgd2hlbjoKICAgICAgdmlzaWJsZTogIkdldCBTdGFydGVkIgogICAgY29tbWFuZHM6CiAgICAgIC0gdGFwT246ICJHZXQgU3RhcnRlZCIKICAgICAgLSB3YWl0Rm9yQW5pbWF0aW9uVG9FbmQ6CiAgICAgICAgICB0aW1lb3V0OiA1MDAwCiAgICAgIC0gdGFrZVNjcmVlbnNob3Q6IHdhbmRlcmxvZ18wM2JfYWZ0ZXJfZ2V0c3RhcnRlZAotIHJlcGVhdDoKICAgIHRpbWVzOiA4CiAgICBjb21tYW5kczoKICAgICAgLSBydW5GbG93OgogICAgICAgICAgd2hlbjoKICAgICAgICAgICAgdmlzaWJsZTogIk5leHQiCiAgICAgICAgICBjb21tYW5kczoKICAgICAgICAgICAgLSB0YXBPbjogIk5leHQiCiAgICAgICAgICAgIC0gd2FpdEZvckFuaW1hdGlvblRvRW5kOgogICAgICAgICAgICAgICAgdGltZW91dDogMzAwMAogICAgICAgICAgICAtIHRha2VTY3JlZW5zaG90OiB3YW5kZXJsb2dfc2xpZGVfbmV4dAogICAgICAtIHJ1bkZsb3c6CiAgICAgICAgICB3aGVuOgogICAgICAgICAgICB2aXNpYmxlOiAiQ29udGludWUiCiAgICAgICAgICBjb21tYW5kczoKICAgICAgICAgICAgLSB0YXBPbjogIkNvbnRpbnVlIgogICAgICAgICAgICAtIHdhaXRGb3JBbmltYXRpb25Ub0VuZDoKICAgICAgICAgICAgICAgIHRpbWVvdXQ6IDMwMDAKICAgICAgICAgICAgLSB0YWtlU2NyZWVuc2hvdDogd2FuZGVybG9nX3NsaWRlX2NvbnRpbnVlCiAgICAgIC0gcnVuRmxvdzoKICAgICAgICAgIHdoZW46CiAgICAgICAgICAgIHZpc2libGU6ICJORVhUIgogICAgICAgICAgY29tbWFuZHM6CiAgICAgICAgICAgIC0gdGFwT246ICJORVhUIgogICAgICAgICAgICAtIHdhaXRGb3JBbmltYXRpb25Ub0VuZDoKICAgICAgICAgICAgICAgIHRpbWVvdXQ6IDMwMDAKICAgICAgICAgICAgLSB0YWtlU2NyZWVuc2hvdDogd2FuZGVybG9nX3NsaWRlX05FWFQKLSBydW5GbG93OgogICAgd2hlbjoKICAgICAgdmlzaWJsZTogIlNraXAiCiAgICBjb21tYW5kczoKICAgICAgLSB0YXBPbjogIlNraXAiCiAgICAgIC0gd2FpdEZvckFuaW1hdGlvblRvRW5kCiAgICAgIC0gdGFrZVNjcmVlbnNob3Q6IHdhbmRlcmxvZ19za2lwCi0gcnVuRmxvdzoKICAgIHdoZW46CiAgICAgIHZpc2libGU6ICJNYXliZSBsYXRlciIKICAgIGNvbW1hbmRzOgogICAgICAtIHRhcE9uOiAiTWF5YmUgbGF0ZXIiCiAgICAgIC0gd2FpdEZvckFuaW1hdGlvblRvRW5kCi0gcnVuRmxvdzoKICAgIHdoZW46CiAgICAgIHZpc2libGU6ICJOb3Qgbm93IgogICAgY29tbWFuZHM6CiAgICAgIC0gdGFwT246ICJOb3Qgbm93IgogICAgICAtIHdhaXRGb3JBbmltYXRpb25Ub0VuZAotIHRha2VTY3JlZW5zaG90OiB3YW5kZXJsb2dfMDRfcG9zdF9vbmJvYXJkaW5nCi0gcnVuRmxvdzoKICAgIHdoZW46CiAgICAgIHZpc2libGU6ICJUcmlwcyIKICAgIGNvbW1hbmRzOgogICAgICAtIHRhcE9uOiAiVHJpcHMiCiAgICAgIC0gd2FpdEZvckFuaW1hdGlvblRvRW5kOgogICAgICAgICAgdGltZW91dDogMzAwMAogICAgICAtIHRha2VTY3JlZW5zaG90OiB3YW5kZXJsb2dfMDVfdHJpcHMKLSBydW5GbG93OgogICAgd2hlbjoKICAgICAgdmlzaWJsZTogIkV4cGxvcmUiCiAgICBjb21tYW5kczoKICAgICAgLSB0YXBPbjogIkV4cGxvcmUiCiAgICAgIC0gd2FpdEZvckFuaW1hdGlvblRvRW5kOgogICAgICAgICAgdGltZW91dDogMzAwMAogICAgICAtIHRha2VTY3JlZW5zaG90OiB3YW5kZXJsb2dfMDZfZXhwbG9yZQotIHJ1bkZsb3c6CiAgICB3aGVuOgogICAgICB2aXNpYmxlOiAiUHJvZmlsZSIKICAgIGNvbW1hbmRzOgogICAgICAtIHRhcE9uOiAiUHJvZmlsZSIKICAgICAgLSB3YWl0Rm9yQW5pbWF0aW9uVG9FbmQ6CiAgICAgICAgICB0aW1lb3V0OiAzMDAwCiAgICAgIC0gdGFrZVNjcmVlbnNob3Q6IHdhbmRlcmxvZ18wN19wcm9maWxlCi0gcnVuRmxvdzoKICAgIHdoZW46CiAgICAgIHZpc2libGU6ICJCdWRnZXQiCiAgICBjb21tYW5kczoKICAgICAgLSB0YXBPbjogIkJ1ZGdldCIKICAgICAgLSB3YWl0Rm9yQW5pbWF0aW9uVG9FbmQ6CiAgICAgICAgICB0aW1lb3V0OiAzMDAwCiAgICAgIC0gdGFrZVNjcmVlbnNob3Q6IHdhbmRlcmxvZ18wOF9idWRnZXQKLSB0YWtlU2NyZWVuc2hvdDogd2FuZGVybG9nXzA5X2ZpbmFsCg=="
           echo "$WANDERLOG_FLOW_B64" | base64 --decode > /tmp/maestro/wanderlog_flow.yaml
-          echo "Flow lines: $(wc -l < /tmp/maestro/wanderlog_flow.yaml)"
 
           maestro --device "$SIM_ID" test /tmp/maestro/wanderlog_flow.yaml \
             2>&1 | tee "$OUT/maestro_log.txt" || true
@@ -252,7 +393,6 @@ jobs:
           if [ -n "$MAESTRO_OUT" ]; then
             find "$MAESTRO_OUT" -name "*.png" -exec cp {} "$OUT/" \; 2>/dev/null || true
           fi
-
           echo "Total screenshots: $(ls $OUT/*.png 2>/dev/null | wc -l)"
 
       - name: Dump Wanderlog container
@@ -273,73 +413,35 @@ jobs:
             echo "No container"
           fi
 
-      # ─── NETWORK CAPTURE ───────────────────────────────────────────────────
-
-      - name: Setup mitmproxy
-        run: |
-          pip3 install mitmproxy --quiet --break-system-packages 2>&1 | tail -3
-          mkdir -p /tmp/artifacts/network
-          mitmdump -p 8889 --set block_global=false &
-          MPID=$!; sleep 8; kill $MPID 2>/dev/null || true
-          xcrun simctl keychain "${{ env.SIM_ID }}" add-root-cert ~/.mitmproxy/mitmproxy-ca-cert.pem
-          echo "mitmproxy CA trusted"
-
-      - name: Build SSL kill-switch dylib
-        run: |
-          cat > /tmp/ssl_killswitch.m << 'CEOF'
-          #include <Security/Security.h>
-          Boolean SecTrustEvaluateWithError(SecTrustRef t, CFErrorRef *e) {
-              if (e) *e = NULL; return true;
-          }
-          OSStatus SecTrustEvaluate(SecTrustRef t, SecTrustResultType *r) {
-              if (r) *r = kSecTrustResultProceed; return 0;
-          }
-          CEOF
-          SDK=$(xcrun --sdk iphonesimulator --show-sdk-path)
-          clang -arch arm64 -dynamiclib \
-            -target arm64-apple-ios16.0-simulator \
-            -isysroot "$SDK" \
-            -framework Security \
-            -o /tmp/ssl_killswitch.dylib \
-            /tmp/ssl_killswitch.m 2>&1 \
-          && echo "SSL kill-switch OK" || echo "Build failed — running without SSL bypass"
-
-      - name: Capture Tripsy network traffic
-        run: |
-          SIM_ID="${{ env.SIM_ID }}"
-          xcrun simctl terminate "$SIM_ID" "app.tripsy.ios" 2>/dev/null || true
-          sleep 2
-          mitmdump -p 8888 --save-stream-file /tmp/artifacts/network/tripsy_traffic.mitm \
-            --set block_global=false -q &
-          MPID=$!; sleep 3
-          DYLD_ARG=""
-          [ -f /tmp/ssl_killswitch.dylib ] && DYLD_ARG="DYLD_INSERT_LIBRARIES=/tmp/ssl_killswitch.dylib"
-          xcrun simctl launch --terminate-running-process "$SIM_ID" "app.tripsy.ios" \
-            $DYLD_ARG \
-            https_proxy=http://127.0.0.1:8888 \
-            http_proxy=http://127.0.0.1:8888 2>&1 || true
-          echo "Capturing 45s..."; sleep 45
-          kill $MPID 2>/dev/null; sleep 2
-          echo "Tripsy traffic: $(wc -c < /tmp/artifacts/network/tripsy_traffic.mitm 2>/dev/null || echo 0) bytes"
+      # ─── NETWORK CAPTURE — WANDERLOG ───────────────────────────────────────
 
       - name: Capture Wanderlog network traffic
         run: |
           SIM_ID="${{ env.SIM_ID }}"
+          BUNDLE_ID="com.wanderlog.ios"
+
           xcrun simctl terminate "$SIM_ID" "app.tripsy.ios" 2>/dev/null || true
-          xcrun simctl terminate "$SIM_ID" "com.wanderlog.ios" 2>/dev/null || true
+          xcrun simctl terminate "$SIM_ID" "$BUNDLE_ID" 2>/dev/null || true
           sleep 2
-          mitmdump -p 8888 --save-stream-file /tmp/artifacts/network/wanderlog_traffic.mitm \
+
+          mitmdump -p 8888 \
+            --save-stream-file /tmp/artifacts/network/wanderlog_traffic.mitm \
             --set block_global=false -q &
           MPID=$!; sleep 3
-          DYLD_ARG=""
-          [ -f /tmp/ssl_killswitch.dylib ] && DYLD_ARG="DYLD_INSERT_LIBRARIES=/tmp/ssl_killswitch.dylib"
-          xcrun simctl launch --terminate-running-process "$SIM_ID" "com.wanderlog.ios" \
-            $DYLD_ARG \
-            https_proxy=http://127.0.0.1:8888 \
-            http_proxy=http://127.0.0.1:8888 2>&1 || true
-          echo "Capturing 45s..."; sleep 45
+
+          if [ -f /tmp/ssl_killswitch.dylib ]; then
+            xcrun simctl launch --terminate-running-process "$SIM_ID" "$BUNDLE_ID" \
+              DYLD_INSERT_LIBRARIES=/tmp/ssl_killswitch.dylib 2>&1 || true
+          else
+            xcrun simctl launch "$SIM_ID" "$BUNDLE_ID" 2>&1 || true
+          fi
+
+          echo "Capturing 60s..."
+          sleep 60
           kill $MPID 2>/dev/null; sleep 2
-          echo "Wanderlog traffic: $(wc -c < /tmp/artifacts/network/wanderlog_traffic.mitm 2>/dev/null || echo 0) bytes"
+          echo "Wanderlog traffic: $(wc -c < /tmp/artifacts/network/wanderlog_traffic.mitm) bytes"
+
+      # ─── PARSE FLOWS ────────────────────────────────────────────────────────
 
       - name: Parse network flows to JSON
         if: always()
@@ -378,7 +480,16 @@ jobs:
                           f"/tmp/artifacts/network/{fname}.json")
           PYEOF
 
-      # ─── UPLOAD ────────────────────────────────────────────────────────────
+      # ─── CLEANUP + UPLOAD ──────────────────────────────────────────────────
+
+      - name: Cleanup system proxy
+        if: always()
+        run: |
+          for svc in "Wi-Fi" "Ethernet" "USB 10/100/1000 LAN" "Thunderbolt Bridge"; do
+            networksetup -setwebproxystate "$svc" off 2>/dev/null || true
+            networksetup -setsecurewebproxystate "$svc" off 2>/dev/null || true
+          done
+          echo "System proxy disabled"
 
       - name: List artifacts
         if: always()
@@ -388,6 +499,7 @@ jobs:
           echo ""
           echo "Tripsy screenshots: $(ls /tmp/artifacts/tripsy-screenshots/*.png 2>/dev/null | wc -l)"
           echo "Wanderlog screenshots: $(ls /tmp/artifacts/wanderlog-screenshots/*.png 2>/dev/null | wc -l)"
+          echo "Network: tripsy=$(wc -c < /tmp/artifacts/network/tripsy_traffic.mitm 2>/dev/null || echo 0)B wanderlog=$(wc -c < /tmp/artifacts/network/wanderlog_traffic.mitm 2>/dev/null || echo 0)B"
 
       - name: Upload tripsy-dynamic
         uses: actions/upload-artifact@v4
