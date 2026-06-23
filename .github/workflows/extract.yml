@@ -11,49 +11,170 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          lfs: false
 
-      - name: Build cartool
+      - name: Try assetutil (built-in, no compile needed)
+        id: assetutil
         run: |
-          git clone --depth 1 https://github.com/steventroughtonsmith/cartool.git /tmp/cartool
-          cd /tmp/cartool
+          mkdir -p output/tripsy output/wanderlog
+          echo "=== assetutil version ==="
+          /usr/bin/assetutil --help 2>&1 | head -10 || true
+
+          # assetutil --extract <outdir> <car>
+          if /usr/bin/assetutil --extract output/tripsy Tripsy.car 2>&1; then
+            COUNT=$(ls output/tripsy/ 2>/dev/null | wc -l | tr -d ' ')
+            echo "tripsy_count=$COUNT" >> $GITHUB_OUTPUT
+            echo "Tripsy: $COUNT files via assetutil"
+          else
+            echo "tripsy_count=0" >> $GITHUB_OUTPUT
+            echo "assetutil failed for Tripsy"
+          fi
+
+          if /usr/bin/assetutil --extract output/wanderlog Wanderlog.car 2>&1; then
+            COUNT=$(ls output/wanderlog/ 2>/dev/null | wc -l | tr -d ' ')
+            echo "wanderlog_count=$COUNT" >> $GITHUB_OUTPUT
+            echo "Wanderlog: $COUNT files via assetutil"
+          else
+            echo "wanderlog_count=0" >> $GITHUB_OUTPUT
+            echo "assetutil failed for Wanderlog"
+          fi
+
+      - name: Build patched cartool (fallback if assetutil got 0 files)
+        if: steps.assetutil.outputs.tripsy_count == '0'
+        run: |
+          git clone --depth 1 https://github.com/steventroughtonsmith/cartool.git /tmp/cartool-src
+          cd /tmp/cartool-src
+
+          echo "=== Patching source for Xcode 16 ==="
+          # Fix CGImageRef pointer cast
+          sed -i '' \
+            's/CGImageRef cgImage = \[image image\]/CGImageRef cgImage = (__bridge CGImageRef)[image image]/g' \
+            cartool/main.m || true
+          # Show the context
+          grep -n "cgImage\|CGImageRef" cartool/main.m | head -10
+
+          echo "=== Building ==="
           xcodebuild \
             -scheme cartool \
             -configuration Release \
             -derivedDataPath /tmp/cartool-build \
-            ONLY_ACTIVE_ARCH=NO \
-            BUILD_LIBRARY_FOR_DISTRIBUTION=NO \
-            2>&1 | tail -20
-          find /tmp/cartool-build -name "cartool" -type f | head -3
+            ONLY_ACTIVE_ARCH=YES \
+            ARCHS=arm64 \
+            GCC_TREAT_WARNINGS_AS_ERRORS=NO \
+            SWIFT_TREAT_WARNINGS_AS_ERRORS=NO \
+            OTHER_CFLAGS="-Wno-everything -Wno-error" \
+            MACOSX_DEPLOYMENT_TARGET="13.0" \
+            2>&1 | grep -E "(error:|warning: |BUILD |FAILED|SUCCEEDED|cartool)" | grep -v "^$" | head -40
 
-      - name: Extract Tripsy
-        run: |
-          CARTOOL=$(find /tmp/cartool-build -name "cartool" -type f | head -1)
-          echo "Using: $CARTOOL"
-          mkdir -p output/tripsy
-          "$CARTOOL" Tripsy.car output/tripsy/ 2>&1 | tail -5
-          echo "Extracted: $(ls output/tripsy/ | wc -l) files"
-          ls output/tripsy/ | head -20
+          BINARY=$(find /tmp/cartool-build -name "cartool" -perm +111 -type f | head -1)
+          echo "Binary found: $BINARY"
+          echo "CARTOOL=$BINARY" >> $GITHUB_ENV
 
-      - name: Extract Wanderlog
+      - name: Extract with cartool (fallback)
+        if: steps.assetutil.outputs.tripsy_count == '0' && env.CARTOOL != ''
         run: |
-          CARTOOL=$(find /tmp/cartool-build -name "cartool" -type f | head -1)
-          mkdir -p output/wanderlog
-          "$CARTOOL" Wanderlog.car output/wanderlog/ 2>&1 | tail -5
-          echo "Extracted: $(ls output/wanderlog/ | wc -l) files"
-          ls output/wanderlog/ | head -20
+          echo "Using cartool: $CARTOOL"
+          mkdir -p output/tripsy output/wanderlog
+          "$CARTOOL" Tripsy.car output/tripsy/ 2>&1
+          echo "Tripsy: $(ls output/tripsy/ | wc -l) files"
+          "$CARTOOL" Wanderlog.car output/wanderlog/ 2>&1
+          echo "Wanderlog: $(ls output/wanderlog/ | wc -l) files"
+
+      - name: Build Swift extractor (last resort)
+        if: steps.assetutil.outputs.tripsy_count == '0'
+        run: |
+          TRIPSY_COUNT=$(ls output/tripsy/ 2>/dev/null | wc -l | tr -d ' ')
+          if [ "$TRIPSY_COUNT" -gt "0" ]; then
+            echo "Already have files, skipping Swift extractor"
+            exit 0
+          fi
+
+          cat > /tmp/extract_car.swift << 'SWIFT'
+          import Foundation
+          import CoreGraphics
+          import ImageIO
+
+          let coreUIPath = "/System/Library/PrivateFrameworks/CoreUI.framework"
+          guard let bundle = Bundle(path: coreUIPath), bundle.load() else {
+              fputs("ERROR: Could not load CoreUI\n", stderr); exit(1)
+          }
+          guard let CUICatalogClass = NSClassFromString("CUICatalog") else {
+              fputs("ERROR: CUICatalog not found\n", stderr); exit(1)
+          }
+
+          let carPath = CommandLine.arguments[1]
+          let outPath = CommandLine.arguments[2]
+          let carURL = URL(fileURLWithPath: carPath)
+
+          var nsErr: NSError? = nil
+          let alloc = CUICatalogClass.alloc()
+          let selInit = NSSelectorFromString("initWithURL:error:")
+          guard let catalog = alloc?.perform(selInit, with: carURL, with: &nsErr)?.takeRetainedValue() as? NSObject else {
+              fputs("ERROR: Could not init CUICatalog: \(nsErr?.localizedDescription ?? "unknown")\n", stderr); exit(1)
+          }
+
+          let selNames = NSSelectorFromString("allImageNames")
+          guard let names = catalog.perform(selNames)?.takeRetainedValue() as? [String] else {
+              fputs("ERROR: Could not get image names\n", stderr); exit(1)
+          }
+
+          let fm = FileManager.default
+          try! fm.createDirectory(atPath: outPath, withIntermediateDirectories: true)
+
+          let selImage = NSSelectorFromString("imageWithName:scaleFactor:")
+          let selCGImage = NSSelectorFromString("image")
+          var count = 0
+
+          for name in names {
+              guard let namedImage = catalog.perform(selImage, with: name, with: 2.0)?
+                      .takeRetainedValue() as? NSObject else { continue }
+              guard let cgImageObj = namedImage.perform(selCGImage)?
+                      .takeRetainedValue() else { continue }
+              let cgImage = unsafeBitCast(cgImageObj, to: CGImage.self)
+              let safe = name.replacingOccurrences(of: "/", with: "_")
+              let outFile = "\(outPath)/\(safe).png"
+              guard let dest = CGImageDestinationCreateWithURL(
+                  URL(fileURLWithPath: outFile) as CFURL, "public.png" as CFString, 1, nil) else { continue }
+              CGImageDestinationAddImage(dest, cgImage, nil)
+              CGImageDestinationFinalize(dest)
+              count += 1
+          }
+          print("Extracted \(count) / \(names.count) images")
+          SWIFT
+
+          swiftc -O /tmp/extract_car.swift -o /tmp/extract_car \
+            -framework CoreGraphics -framework ImageIO -framework Foundation 2>&1
+
+          if [ -f /tmp/extract_car ]; then
+            echo "Swift extractor compiled OK"
+            mkdir -p output/tripsy output/wanderlog
+            /tmp/extract_car Tripsy.car output/tripsy/ 2>&1
+            echo "Tripsy: $(ls output/tripsy/ | wc -l) files"
+            /tmp/extract_car Wanderlog.car output/wanderlog/ 2>&1
+            echo "Wanderlog: $(ls output/wanderlog/ | wc -l) files"
+          else
+            echo "Swift compile failed"
+          fi
+
+      - name: Summary
+        run: |
+          echo "=== Tripsy ($(ls output/tripsy/ 2>/dev/null | wc -l | tr -d ' ') files) ==="
+          ls output/tripsy/ | head -30
+          echo ""
+          echo "=== Wanderlog ($(ls output/wanderlog/ 2>/dev/null | wc -l | tr -d ' ') files) ==="
+          ls output/wanderlog/ | head -30
 
       - name: Upload Tripsy assets
         uses: actions/upload-artifact@v4
         with:
           name: tripsy-assets
           path: output/tripsy/
-          retention-days: 7
+          retention-days: 14
+          if-no-files-found: warn
 
       - name: Upload Wanderlog assets
         uses: actions/upload-artifact@v4
         with:
           name: wanderlog-assets
           path: output/wanderlog/
-          retention-days: 7
+          retention-days: 14
+          if-no-files-found: warn
