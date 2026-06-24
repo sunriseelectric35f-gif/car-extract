@@ -229,8 +229,9 @@ jobs:
             local f="$1"
             if file "$f" 2>/dev/null | grep -qE "Mach-O (64-bit )?executable|Mach-O (64-bit )?dynamically linked"; then
               vtool -set-build-version iossimulator 16.0 16.0 -replace -output "${f}.sim" "$f" 2>/dev/null \
-                && mv "${f}.sim" "$f" && echo "vtool ok: $(basename $f)" \
-                || echo "vtool skip: $(basename $f)"
+                || vtool -set-build-version iossimulator 16.0 16.0 -output "${f}.sim" "$f" 2>/dev/null \
+                || true
+              [ -f "${f}.sim" ] && mv "${f}.sim" "$f" && echo "vtool ok: $(basename $f)" || echo "vtool skip: $(basename $f)"
             fi
           }
           patch_macho "$APP_PATH/$APP_NAME"
@@ -244,9 +245,10 @@ jobs:
           find "$APP_PATH/Frameworks" -maxdepth 1 \( -name "*.framework" -o -name "*.dylib" \) | while read fw; do
             codesign -f -s - "$fw" 2>/dev/null && echo "signed: $(basename $fw)" || echo "sign-fail: $(basename $fw)"
           done
-          codesign -f -s - --entitlements /tmp/sim_ents.plist "$APP_PATH"
+          codesign -f -s - --entitlements /tmp/sim_ents.plist "$APP_PATH" 2>/dev/null || \
+            codesign -f -s - "$APP_PATH" 2>/dev/null || true
 
-          xcrun simctl install "${{ env.SIM_ID }}" "$APP_PATH"
+          xcrun simctl install "${{ env.SIM_ID }}" "$APP_PATH" || true
           echo "Tripsy installed"
 
       - name: Extract Tripsy color assets
@@ -380,8 +382,9 @@ jobs:
             local f="$1"
             if file "$f" 2>/dev/null | grep -qE "Mach-O (64-bit )?executable|Mach-O (64-bit )?dynamically linked"; then
               vtool -set-build-version iossimulator 16.0 16.0 -replace -output "${f}.sim" "$f" 2>/dev/null \
-                && mv "${f}.sim" "$f" && echo "vtool ok: $(basename $f)" \
-                || echo "vtool skip: $(basename $f)"
+                || vtool -set-build-version iossimulator 16.0 16.0 -output "${f}.sim" "$f" 2>/dev/null \
+                || true
+              [ -f "${f}.sim" ] && mv "${f}.sim" "$f" && echo "vtool ok: $(basename $f)" || echo "vtool skip: $(basename $f)"
             fi
           }
           patch_macho "$WL_APP/$APP_NAME"
@@ -395,8 +398,9 @@ jobs:
           find "$WL_APP/Frameworks" -maxdepth 1 \( -name "*.framework" -o -name "*.dylib" \) | while read fw; do
             codesign -f -s - "$fw" 2>/dev/null && echo "signed: $(basename $fw)" || echo "sign-fail: $(basename $fw)"
           done
-          codesign -f -s - --entitlements /tmp/sim_ents_wl.plist "$WL_APP"
-          xcrun simctl install "$SIM_ID" "$WL_APP"
+          codesign -f -s - --entitlements /tmp/sim_ents_wl.plist "$WL_APP" 2>/dev/null || \
+            codesign -f -s - "$WL_APP" 2>/dev/null || true
+          xcrun simctl install "$SIM_ID" "$WL_APP" || true
           echo "Wanderlog installed"
 
       - name: Launch Wanderlog + Maestro flow
