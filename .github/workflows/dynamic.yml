@@ -284,8 +284,9 @@ jobs:
           OUT="/tmp/artifacts/tripsy-screenshots"
           mkdir -p "$OUT" /tmp/maestro
 
-          echo "Launching Tripsy..."
-          xcrun simctl launch "$SIM_ID" "$BUNDLE_ID" 2>&1 || true
+          echo "Launching Tripsy with SSL kill-switch..."
+          xcrun simctl launch "$SIM_ID" "$BUNDLE_ID" \
+            DYLD_INSERT_LIBRARIES=/tmp/ssl_killswitch.dylib 2>&1 || true
           sleep 18
 
           xcrun simctl io "$SIM_ID" screenshot "$OUT/00_launch_raw.png" 2>/dev/null || true
@@ -405,9 +406,10 @@ jobs:
           OUT="/tmp/artifacts/wanderlog-screenshots"
           mkdir -p "$OUT"
 
-          echo "Launching Wanderlog..."
-          xcrun simctl launch "$SIM_ID" "$BUNDLE_ID" 2>&1 || true
-          sleep 22
+          echo "Launching Wanderlog with SSL kill-switch..."
+          xcrun simctl launch "$SIM_ID" "$BUNDLE_ID" \
+            DYLD_INSERT_LIBRARIES=/tmp/ssl_killswitch.dylib 2>&1 || true
+          sleep 18
 
           xcrun simctl io "$SIM_ID" screenshot "$OUT/00_launch_raw.png" 2>/dev/null || true
 
