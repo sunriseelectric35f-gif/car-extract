@@ -65,18 +65,23 @@ jobs:
             python3 /tmp/patch_lc.py "$f" 2>/dev/null || true
           done
 
-          find "$APP_PATH/Frameworks" -maxdepth 2 -type f | while read f; do
-            file "$f" 2>/dev/null | grep -qE "Mach-O" && codesign --remove-signature "$f" 2>/dev/null || true
-          done
-          codesign --remove-signature "$APP_PATH/$APP_NAME" 2>/dev/null || true
-          codesign --remove-signature "$APP_PATH" 2>/dev/null || true
+          # Nuke all stale code signatures completely
+          find "$APP_PATH" -name "_CodeSignature" -type d -exec rm -rf {} + 2>/dev/null || true
+          find "$APP_PATH" -name "*.mobileprovision" -delete 2>/dev/null || true
+
+          # Sign frameworks bottom-up
           find "$APP_PATH/Frameworks" -maxdepth 1 \( -name "*.framework" -o -name "*.dylib" \) | while read fw; do
             perl -e 'alarm 15; exec @ARGV' -- codesign -f -s - "$fw" 2>/dev/null \
               && echo "signed: $(basename $fw)" || echo "sign-fail: $(basename $fw)"
           done
+
+          # Write entitlements plist (Python avoids YAML heredoc issues)
           python3 -c "open('/tmp/sim_ents_tripsy.plist','w').write('<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict><key>get-task-allow</key><true/></dict></plist>')"
-          perl -e 'alarm 20; exec @ARGV' -- codesign -f -s - --entitlements /tmp/sim_ents_tripsy.plist "$APP_PATH" 2>/dev/null || \
-            perl -e 'alarm 20; exec @ARGV' -- codesign -f -s - "$APP_PATH" 2>/dev/null || true
+
+          # Sign the .app bundle (entitlements required for simulator launch)
+          perl -e 'alarm 30; exec @ARGV' -- codesign -f -s - \
+            --entitlements /tmp/sim_ents_tripsy.plist "$APP_PATH" 2>&1 || true
+          codesign -vv "$APP_PATH" 2>&1 | tail -3 || true
           perl -e 'alarm 30; exec @ARGV' -- xcrun simctl install "${{ env.SIM_ID }}" "$APP_PATH" 2>&1 || true
           echo "Tripsy installed"
 
@@ -112,18 +117,23 @@ jobs:
             python3 /tmp/patch_lc.py "$f" 2>/dev/null || true
           done
 
-          find "$WL_APP/Frameworks" -maxdepth 2 -type f | while read f; do
-            file "$f" 2>/dev/null | grep -qE "Mach-O" && codesign --remove-signature "$f" 2>/dev/null || true
-          done
-          codesign --remove-signature "$WL_APP/$APP_NAME" 2>/dev/null || true
-          codesign --remove-signature "$WL_APP" 2>/dev/null || true
+          # Nuke all stale code signatures completely
+          find "$WL_APP" -name "_CodeSignature" -type d -exec rm -rf {} + 2>/dev/null || true
+          find "$WL_APP" -name "*.mobileprovision" -delete 2>/dev/null || true
+
+          # Sign frameworks bottom-up
           find "$WL_APP/Frameworks" -maxdepth 1 \( -name "*.framework" -o -name "*.dylib" \) | while read fw; do
             perl -e 'alarm 15; exec @ARGV' -- codesign -f -s - "$fw" 2>/dev/null \
               && echo "signed: $(basename $fw)" || echo "sign-fail: $(basename $fw)"
           done
+
+          # Write entitlements plist
           python3 -c "open('/tmp/sim_ents_wl.plist','w').write('<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict><key>get-task-allow</key><true/></dict></plist>')"
-          perl -e 'alarm 20; exec @ARGV' -- codesign -f -s - --entitlements /tmp/sim_ents_wl.plist "$WL_APP" 2>/dev/null || \
-            perl -e 'alarm 20; exec @ARGV' -- codesign -f -s - "$WL_APP" 2>/dev/null || true
+
+          # Sign the .app bundle
+          perl -e 'alarm 30; exec @ARGV' -- codesign -f -s - \
+            --entitlements /tmp/sim_ents_wl.plist "$WL_APP" 2>&1 || true
+          codesign -vv "$WL_APP" 2>&1 | tail -3 || true
           perl -e 'alarm 30; exec @ARGV' -- xcrun simctl install "$SIM_ID" "$WL_APP" 2>&1 || true
           echo "Wanderlog installed"
 
