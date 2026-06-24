@@ -101,107 +101,20 @@ jobs:
       # Required because Tripsy uses custom URLSession:task:didReceiveChallenge: pinning.
 
       - name: Build SSL kill-switch dylib
+        timeout-minutes: 3
         run: |
-          cat > /tmp/ssl_killswitch.m << 'CEOF'
-          #import <Foundation/Foundation.h>
-          #include <Security/Security.h>
-          #include <objc/runtime.h>
-
-          // ── C-level interposition (DYLD_INTERPOSE avoids conflicting-type redeclaration) ──
-          // Xcode 15+ SDK declares SecTrustEvaluateWithError returning `bool` not `Boolean`
-          #define DYLD_INTERPOSE(_new, _old) \
-              __attribute__((used)) static struct { const void *r; const void *o; } \
-              _interpose_##_old __attribute__((section("__DATA,__interpose"))) = \
-              { (const void *)(unsigned long)&_new, (const void *)(unsigned long)&_old }
-
-          static bool my_SecTrustEvaluateWithError(SecTrustRef t, CFErrorRef *e) {
-              if (e) *e = NULL; return true;
-          }
-          static OSStatus my_SecTrustEvaluate(SecTrustRef t, SecTrustResultType *r) {
-              if (r) *r = kSecTrustResultProceed; return 0;
-          }
-          static OSStatus my_SecTrustGetTrustResult(SecTrustRef t, SecTrustResultType *r) {
-              if (r) *r = kSecTrustResultProceed; return 0;
-          }
-          DYLD_INTERPOSE(my_SecTrustEvaluateWithError, SecTrustEvaluateWithError);
-          DYLD_INTERPOSE(my_SecTrustEvaluate, SecTrustEvaluate);
-          DYLD_INTERPOSE(my_SecTrustGetTrustResult, SecTrustGetTrustResult);
-
-          // ── ObjC-level challenge bypass ────────────────────────────────────
-          // Hooks ALL classes implementing URLSession challenge delegates.
-          // This bypasses custom delegate-based cert pinning (Tripsy pattern).
-
-          static void bypass_task_challenge(
-              id self, SEL _cmd,
-              NSURLSession *session, NSURLSessionTask *task,
-              NSURLAuthenticationChallenge *challenge,
-              void (^handler)(NSURLSessionAuthChallengeDisposition, NSURLCredential *)
-          ) {
-              NSString *method = [[challenge protectionSpace] authenticationMethod];
-              if ([method isEqualToString:NSURLAuthenticationMethodServerTrust]) {
-                  SecTrustRef trust = [[challenge protectionSpace] serverTrust];
-                  NSURLCredential *cred = [NSURLCredential credentialForTrust:trust];
-                  handler(NSURLSessionAuthChallengeUseCredential, cred);
-              } else {
-                  handler(NSURLSessionAuthChallengePerformDefaultHandling, nil);
-              }
-          }
-
-          static void bypass_session_challenge(
-              id self, SEL _cmd,
-              NSURLSession *session,
-              NSURLAuthenticationChallenge *challenge,
-              void (^handler)(NSURLSessionAuthChallengeDisposition, NSURLCredential *)
-          ) {
-              NSString *method = [[challenge protectionSpace] authenticationMethod];
-              if ([method isEqualToString:NSURLAuthenticationMethodServerTrust]) {
-                  SecTrustRef trust = [[challenge protectionSpace] serverTrust];
-                  NSURLCredential *cred = [NSURLCredential credentialForTrust:trust];
-                  handler(NSURLSessionAuthChallengeUseCredential, cred);
-              } else {
-                  handler(NSURLSessionAuthChallengePerformDefaultHandling, nil);
-              }
-          }
-
-          __attribute__((constructor))
-          static void ssl_killswitch_init() {
-              // Delay to allow Swift runtime to register all classes
-              dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
-                             dispatch_get_main_queue(), ^{
-                  unsigned int count;
-                  Class *classes = objc_copyClassList(&count);
-
-                  SEL taskSel = NSSelectorFromString(@"URLSession:task:didReceiveChallenge:completionHandler:");
-                  SEL sessSel = NSSelectorFromString(@"URLSession:didReceiveChallenge:completionHandler:");
-
-                  int hooked = 0;
-                  for (unsigned int i = 0; i < count; i++) {
-                      Class cls = classes[i];
-                      Method m;
-                      if ((m = class_getInstanceMethod(cls, taskSel))) {
-                          method_setImplementation(m, (IMP)bypass_task_challenge);
-                          hooked++;
-                      }
-                      if ((m = class_getInstanceMethod(cls, sessSel))) {
-                          method_setImplementation(m, (IMP)bypass_session_challenge);
-                          hooked++;
-                      }
-                  }
-                  free(classes);
-                  NSLog(@"[ssl-killswitch] hooked %d challenge handlers", hooked);
-              });
-          }
-          CEOF
+          echo "I2luY2x1ZGUgPFNlY3VyaXR5L1NlY3VyaXR5Lmg+CiNpbmNsdWRlIDxzdGRib29sLmg+CiNkZWZpbmUgRFlMRF9JTlRFUlBPU0UoX25ldywgX29sZCkgICAgIF9fYXR0cmlidXRlX18oKHVzZWQpKSBzdGF0aWMgc3RydWN0IHsgY29uc3Qgdm9pZCAqcjsgY29uc3Qgdm9pZCAqbzsgfSAgICAgX2ludGVycG9zZV8jI19vbGQgX19hdHRyaWJ1dGVfXygoc2VjdGlvbigiX19EQVRBLF9faW50ZXJwb3NlIikpKSA9ICAgICB7IChjb25zdCB2b2lkICopKHVuc2lnbmVkIGxvbmcpJl9uZXcsIChjb25zdCB2b2lkICopKHVuc2lnbmVkIGxvbmcpJl9vbGQgfQpzdGF0aWMgYm9vbCBteV9TZWNUcnVzdEV2YWx1YXRlV2l0aEVycm9yKFNlY1RydXN0UmVmIHQsIENGRXJyb3JSZWYgKmUpIHsKICAgIGlmIChlKSAqZSA9IE5VTEw7IHJldHVybiB0cnVlOwp9CnN0YXRpYyBPU1N0YXR1cyBteV9TZWNUcnVzdEV2YWx1YXRlKFNlY1RydXN0UmVmIHQsIFNlY1RydXN0UmVzdWx0VHlwZSAqcikgewogICAgaWYgKHIpICpyID0ga1NlY1RydXN0UmVzdWx0UHJvY2VlZDsgcmV0dXJuIDA7Cn0Kc3RhdGljIE9TU3RhdHVzIG15X1NlY1RydXN0R2V0VHJ1c3RSZXN1bHQoU2VjVHJ1c3RSZWYgdCwgU2VjVHJ1c3RSZXN1bHRUeXBlICpyKSB7CiAgICBpZiAocikgKnIgPSBrU2VjVHJ1c3RSZXN1bHRQcm9jZWVkOyByZXR1cm4gMDsKfQpEWUxEX0lOVEVSUE9TRShteV9TZWNUcnVzdEV2YWx1YXRlV2l0aEVycm9yLCBTZWNUcnVzdEV2YWx1YXRlV2l0aEVycm9yKTsKRFlMRF9JTlRFUlBPU0UobXlfU2VjVHJ1c3RFdmFsdWF0ZSwgU2VjVHJ1c3RFdmFsdWF0ZSk7CkRZTERfSU5URVJQT1NFKG15X1NlY1RydXN0R2V0VHJ1c3RSZXN1bHQsIFNlY1RydXN0R2V0VHJ1c3RSZXN1bHQpOwo=" \
+            | base64 --decode > /tmp/ssl_killswitch.c
 
           SDK=$(xcrun --sdk iphonesimulator --show-sdk-path)
           clang -arch arm64 -dynamiclib \
             -target arm64-apple-ios16.0-simulator \
             -isysroot "$SDK" \
             -framework Security \
-            -framework Foundation \
+            -Wno-deprecated-declarations \
             -o /tmp/ssl_killswitch.dylib \
-            /tmp/ssl_killswitch.m 2>&1 \
-          && echo "SSL kill-switch v2 built OK" || echo "Build failed — proceeding without"
+            /tmp/ssl_killswitch.c 2>&1 \
+          && echo "SSL kill-switch built OK" || echo "Build failed — proceeding without"
 
       # ─── TRIPSY ────────────────────────────────────────────────────────────
 
