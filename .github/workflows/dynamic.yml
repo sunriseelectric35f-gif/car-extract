@@ -138,17 +138,15 @@ jobs:
           </dict></plist>
           ENTSEOF
 
-          patch_macho() {
-            local f="$1"
-            if file "$f" 2>/dev/null | grep -qE "Mach-O (64-bit )?executable|Mach-O (64-bit )?dynamically linked"; then
-              vtool -set-build-version iossimulator 16.0 16.0 -replace -output "${f}.sim" "$f" 2>/dev/null \
-                || vtool -set-build-version iossimulator 16.0 16.0 -output "${f}.sim" "$f" 2>/dev/null \
-                || true
-              [ -f "${f}.sim" ] && mv "${f}.sim" "$f" && echo "vtool ok: $(basename $f)" || echo "vtool skip: $(basename $f)"
-            fi
-          }
-          patch_macho "$APP_PATH/$APP_NAME"
-          find "$APP_PATH/Frameworks" -type f 2>/dev/null | while read f; do patch_macho "$f"; done
+          # Python-based LC_MIN_VERSION_IPHONEOS → LC_MIN_VERSION_IOSSIMULATOR patcher
+          # vtool -replace silently fails on binaries with this older load command
+          echo "aW1wb3J0IHN5cywgc3RydWN0CgpMQ19NSU5fVkVSU0lPTl9JUEhPTkVPUyAgID0gMHgyNQpMQ19NSU5fVkVSU0lPTl9JT1NTSU1VTEFUT1IgPSAweDQzCk1IX01BR0lDXzY0ID0gMHhGRUVERkFDRgpNSF9DSUdBTV82NCA9IDB4Q0ZGQUVERkUKCmRlZiBwYXRjaF9tYWNobyhwYXRoKToKICAgIHdpdGggb3BlbihwYXRoLCAncitiJykgYXMgZjoKICAgICAgICBtYWdpYyA9IHN0cnVjdC51bnBhY2soJzxJJywgZi5yZWFkKDQpKVswXQogICAgICAgIGlmIG1hZ2ljIG5vdCBpbiAoTUhfTUFHSUNfNjQsIE1IX0NJR0FNXzY0KToKICAgICAgICAgICAgcmV0dXJuIEZhbHNlCiAgICAgICAgbGUgPSAobWFnaWMgPT0gTUhfTUFHSUNfNjQpCiAgICAgICAgZm10ID0gJzwnIGlmIGxlIGVsc2UgJz4nCiAgICAgICAgZi5zZWVrKDApCiAgICAgICAgZGF0YSA9IGJ5dGVhcnJheShmLnJlYWQoKSkKICAgICMgZmluZCBsb2FkIGNvbW1hbmRzIHN0YXJ0OiAzMiBieXRlcyBoZWFkZXIgZm9yIDY0LWJpdAogICAgb2ZmID0gMAogICAgbSA9IHN0cnVjdC51bnBhY2tfZnJvbShmbXQrJ0knLCBkYXRhLCBvZmYpWzBdCiAgICBuY21kcyA9IHN0cnVjdC51bnBhY2tfZnJvbShmbXQrJ0knLCBkYXRhLCAxNilbMF0KICAgIHN6X2NtZHMgPSBzdHJ1Y3QudW5wYWNrX2Zyb20oZm10KydJJywgZGF0YSwgMjApWzBdCiAgICBsY19vZmYgPSAzMgogICAgcGF0Y2hlZCA9IEZhbHNlCiAgICBmb3IgXyBpbiByYW5nZShuY21kcyk6CiAgICAgICAgaWYgbGNfb2ZmICsgOCA+IGxlbihkYXRhKToKICAgICAgICAgICAgYnJlYWsKICAgICAgICBjbWQsIGNtZHNpemUgPSBzdHJ1Y3QudW5wYWNrX2Zyb20oZm10KydJSScsIGRhdGEsIGxjX29mZikKICAgICAgICBpZiBjbWQgPT0gTENfTUlOX1ZFUlNJT05fSVBIT05FT1M6CiAgICAgICAgICAgIHN0cnVjdC5wYWNrX2ludG8oZm10KydJJywgZGF0YSwgbGNfb2ZmLCBMQ19NSU5fVkVSU0lPTl9JT1NTSU1VTEFUT1IpCiAgICAgICAgICAgIHBhdGNoZWQgPSBUcnVlCiAgICAgICAgaWYgY21kc2l6ZSA8IDg6CiAgICAgICAgICAgIGJyZWFrCiAgICAgICAgbGNfb2ZmICs9IGNtZHNpemUKICAgIGlmIHBhdGNoZWQ6CiAgICAgICAgd2l0aCBvcGVuKHBhdGgsICd3YicpIGFzIGY6CiAgICAgICAgICAgIGYud3JpdGUoZGF0YSkKICAgIHJldHVybiBwYXRjaGVkCgppZiBfX25hbWVfXyA9PSAnX19tYWluX18nOgogICAgZm9yIHAgaW4gc3lzLmFyZ3ZbMTpdOgogICAgICAgIHIgPSBwYXRjaF9tYWNobyhwKQogICAgICAgIHByaW50KGYne3BhdGNoZWQgaWYgciBlbHNlIHNraXB9OiB7cH0nKQo=" \
+            | base64 --decode > /tmp/patch_lc.py
+
+          python3 /tmp/patch_lc.py "$APP_PATH/$APP_NAME"
+          find "$APP_PATH/Frameworks" -type f 2>/dev/null | while read f; do
+            python3 /tmp/patch_lc.py "$f" 2>/dev/null || true
+          done
 
           find "$APP_PATH/Frameworks" -maxdepth 2 -type f | while read f; do
             file "$f" 2>/dev/null | grep -qE "Mach-O" && codesign --remove-signature "$f" 2>/dev/null || true
@@ -156,12 +154,12 @@ jobs:
           codesign --remove-signature "$APP_PATH/$APP_NAME" 2>/dev/null || true
           codesign --remove-signature "$APP_PATH" 2>/dev/null || true
           find "$APP_PATH/Frameworks" -maxdepth 1 \( -name "*.framework" -o -name "*.dylib" \) | while read fw; do
-            timeout 15s codesign -f -s - "$fw" 2>/dev/null && echo "signed: $(basename $fw)" || echo "sign-fail: $(basename $fw)"
+            perl -e 'alarm 15; exec @ARGV' codesign -f -s - "$fw" 2>/dev/null && echo "signed: $(basename $fw)" || echo "sign-fail: $(basename $fw)"
           done
-          timeout 20s codesign -f -s - --entitlements /tmp/sim_ents.plist "$APP_PATH" 2>/dev/null || \
-            timeout 20s codesign -f -s - "$APP_PATH" 2>/dev/null || true
+          perl -e 'alarm 20; exec @ARGV' codesign -f -s - --entitlements /tmp/sim_ents.plist "$APP_PATH" 2>/dev/null || \
+            perl -e 'alarm 20; exec @ARGV' codesign -f -s - "$APP_PATH" 2>/dev/null || true
 
-          timeout 30s xcrun simctl install "${{ env.SIM_ID }}" "$APP_PATH" || true
+          perl -e 'alarm 30; exec @ARGV' xcrun simctl install "${{ env.SIM_ID }}" "$APP_PATH" 2>&1 || true
           echo "Tripsy installed"
 
       - name: Extract Tripsy color assets
@@ -291,17 +289,10 @@ jobs:
           </dict></plist>
           ENTSEOF
 
-          patch_macho() {
-            local f="$1"
-            if file "$f" 2>/dev/null | grep -qE "Mach-O (64-bit )?executable|Mach-O (64-bit )?dynamically linked"; then
-              vtool -set-build-version iossimulator 16.0 16.0 -replace -output "${f}.sim" "$f" 2>/dev/null \
-                || vtool -set-build-version iossimulator 16.0 16.0 -output "${f}.sim" "$f" 2>/dev/null \
-                || true
-              [ -f "${f}.sim" ] && mv "${f}.sim" "$f" && echo "vtool ok: $(basename $f)" || echo "vtool skip: $(basename $f)"
-            fi
-          }
-          patch_macho "$WL_APP/$APP_NAME"
-          find "$WL_APP/Frameworks" -type f 2>/dev/null | while read f; do patch_macho "$f"; done
+          python3 /tmp/patch_lc.py "$WL_APP/$APP_NAME"
+          find "$WL_APP/Frameworks" -type f 2>/dev/null | while read f; do
+            python3 /tmp/patch_lc.py "$f" 2>/dev/null || true
+          done
 
           find "$WL_APP/Frameworks" -maxdepth 2 -type f | while read f; do
             file "$f" 2>/dev/null | grep -qE "Mach-O" && codesign --remove-signature "$f" 2>/dev/null || true
@@ -309,11 +300,11 @@ jobs:
           codesign --remove-signature "$WL_APP/$APP_NAME" 2>/dev/null || true
           codesign --remove-signature "$WL_APP" 2>/dev/null || true
           find "$WL_APP/Frameworks" -maxdepth 1 \( -name "*.framework" -o -name "*.dylib" \) | while read fw; do
-            timeout 15s codesign -f -s - "$fw" 2>/dev/null && echo "signed: $(basename $fw)" || echo "sign-fail: $(basename $fw)"
+            perl -e 'alarm 15; exec @ARGV' codesign -f -s - "$fw" 2>/dev/null && echo "signed: $(basename $fw)" || echo "sign-fail: $(basename $fw)"
           done
-          timeout 20s codesign -f -s - --entitlements /tmp/sim_ents_wl.plist "$WL_APP" 2>/dev/null || \
-            timeout 20s codesign -f -s - "$WL_APP" 2>/dev/null || true
-          timeout 30s xcrun simctl install "$SIM_ID" "$WL_APP" || true
+          perl -e 'alarm 20; exec @ARGV' codesign -f -s - --entitlements /tmp/sim_ents_wl.plist "$WL_APP" 2>/dev/null || \
+            perl -e 'alarm 20; exec @ARGV' codesign -f -s - "$WL_APP" 2>/dev/null || true
+          perl -e 'alarm 30; exec @ARGV' xcrun simctl install "$SIM_ID" "$WL_APP" 2>&1 || true
           echo "Wanderlog installed"
 
       - name: Launch Wanderlog + Maestro flow
