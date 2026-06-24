@@ -74,7 +74,9 @@ jobs:
             perl -e 'alarm 15; exec @ARGV' -- codesign -f -s - "$fw" 2>/dev/null \
               && echo "signed: $(basename $fw)" || echo "sign-fail: $(basename $fw)"
           done
-          perl -e 'alarm 20; exec @ARGV' -- codesign -f -s - "$APP_PATH" 2>/dev/null || true
+          python3 -c "open('/tmp/sim_ents_tripsy.plist','w').write('<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict><key>get-task-allow</key><true/></dict></plist>')"
+          perl -e 'alarm 20; exec @ARGV' -- codesign -f -s - --entitlements /tmp/sim_ents_tripsy.plist "$APP_PATH" 2>/dev/null || \
+            perl -e 'alarm 20; exec @ARGV' -- codesign -f -s - "$APP_PATH" 2>/dev/null || true
           perl -e 'alarm 30; exec @ARGV' -- xcrun simctl install "${{ env.SIM_ID }}" "$APP_PATH" 2>&1 || true
           echo "Tripsy installed"
 
@@ -83,12 +85,14 @@ jobs:
           SIM_ID="${{ env.SIM_ID }}"
           OUT="/tmp/artifacts/tripsy-screenshots"
           mkdir -p "$OUT"
-          xcrun simctl launch "$SIM_ID" "app.tripsy.ios" 2>&1 || true
+          xcrun simctl launch "$SIM_ID" "app.tripsy.ios" 2>&1 | tee "$OUT/launch.log" || true
           for i in 05 10 15 20 25 30 40 50; do
             sleep 5
             xcrun simctl io "$SIM_ID" screenshot "$OUT/tripsy_${i}s.png" 2>/dev/null || true
-            echo "screenshot at ${i}s"
           done
+          # grab crash logs
+          find ~/Library/Logs/DiagnosticReports -name "Tripsy*" -newer /tmp/ipas/Tripsy.ipa 2>/dev/null \
+            | head -3 | xargs -I{} cp {} "$OUT/" 2>/dev/null || true
           echo "Total: $(ls $OUT/*.png 2>/dev/null | wc -l) screenshots"
 
       - name: Patch + install Wanderlog
@@ -117,7 +121,9 @@ jobs:
             perl -e 'alarm 15; exec @ARGV' -- codesign -f -s - "$fw" 2>/dev/null \
               && echo "signed: $(basename $fw)" || echo "sign-fail: $(basename $fw)"
           done
-          perl -e 'alarm 20; exec @ARGV' -- codesign -f -s - "$WL_APP" 2>/dev/null || true
+          python3 -c "open('/tmp/sim_ents_wl.plist','w').write('<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict><key>get-task-allow</key><true/></dict></plist>')"
+          perl -e 'alarm 20; exec @ARGV' -- codesign -f -s - --entitlements /tmp/sim_ents_wl.plist "$WL_APP" 2>/dev/null || \
+            perl -e 'alarm 20; exec @ARGV' -- codesign -f -s - "$WL_APP" 2>/dev/null || true
           perl -e 'alarm 30; exec @ARGV' -- xcrun simctl install "$SIM_ID" "$WL_APP" 2>&1 || true
           echo "Wanderlog installed"
 
