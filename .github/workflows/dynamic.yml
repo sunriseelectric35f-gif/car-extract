@@ -156,12 +156,12 @@ jobs:
           codesign --remove-signature "$APP_PATH/$APP_NAME" 2>/dev/null || true
           codesign --remove-signature "$APP_PATH" 2>/dev/null || true
           find "$APP_PATH/Frameworks" -maxdepth 1 \( -name "*.framework" -o -name "*.dylib" \) | while read fw; do
-            codesign -f -s - "$fw" 2>/dev/null && echo "signed: $(basename $fw)" || echo "sign-fail: $(basename $fw)"
+            timeout 15s codesign -f -s - "$fw" 2>/dev/null && echo "signed: $(basename $fw)" || echo "sign-fail: $(basename $fw)"
           done
-          codesign -f -s - --entitlements /tmp/sim_ents.plist "$APP_PATH" 2>/dev/null || \
-            codesign -f -s - "$APP_PATH" 2>/dev/null || true
+          timeout 20s codesign -f -s - --entitlements /tmp/sim_ents.plist "$APP_PATH" 2>/dev/null || \
+            timeout 20s codesign -f -s - "$APP_PATH" 2>/dev/null || true
 
-          xcrun simctl install "${{ env.SIM_ID }}" "$APP_PATH" || true
+          timeout 30s xcrun simctl install "${{ env.SIM_ID }}" "$APP_PATH" || true
           echo "Tripsy installed"
 
       - name: Extract Tripsy color assets
@@ -309,11 +309,11 @@ jobs:
           codesign --remove-signature "$WL_APP/$APP_NAME" 2>/dev/null || true
           codesign --remove-signature "$WL_APP" 2>/dev/null || true
           find "$WL_APP/Frameworks" -maxdepth 1 \( -name "*.framework" -o -name "*.dylib" \) | while read fw; do
-            codesign -f -s - "$fw" 2>/dev/null && echo "signed: $(basename $fw)" || echo "sign-fail: $(basename $fw)"
+            timeout 15s codesign -f -s - "$fw" 2>/dev/null && echo "signed: $(basename $fw)" || echo "sign-fail: $(basename $fw)"
           done
-          codesign -f -s - --entitlements /tmp/sim_ents_wl.plist "$WL_APP" 2>/dev/null || \
-            codesign -f -s - "$WL_APP" 2>/dev/null || true
-          xcrun simctl install "$SIM_ID" "$WL_APP" || true
+          timeout 20s codesign -f -s - --entitlements /tmp/sim_ents_wl.plist "$WL_APP" 2>/dev/null || \
+            timeout 20s codesign -f -s - "$WL_APP" 2>/dev/null || true
+          timeout 30s xcrun simctl install "$SIM_ID" "$WL_APP" || true
           echo "Wanderlog installed"
 
       - name: Launch Wanderlog + Maestro flow
